@@ -6,10 +6,18 @@ import os
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 
-from data_utils import compute_class_weights, get_dataloaders
+from data_utils import (
+    BATCH_SIZE,
+    LR,
+    NUM_CLIENTS,
+    NUM_EPOCHS_POOLED,
+    get_dataloaders,
+    get_nb_max_rounds,
+)
 from federated_core import (
+    ClientStepIterator,
+    build_baseline_loss,
     build_efficientnet_b0,
     compute_model_size_mb,
     compute_round_comm_mb,
@@ -20,14 +28,10 @@ from federated_core import (
 )
 
 
-# 클라이언트(병원) 수. 클라이언트별 F1 열 개수를 결정한다 (top3/merge6 모두 3개)
-NUM_CLIENTS = 3
-
 # 매 라운드 CSV에는 검증(validation) 지표만 기록한다. test는 학습 종료 후 1회만 평가한다 (--final_test).
 CSV_FIELDS = [
     "round",
     "method",
-    "mode",
     "mu",
     "seed",
     "eval_split",
@@ -40,6 +44,12 @@ CSV_FIELDS = [
     "max_macro_f1",
     "min_macro_f1",
     "macro_f1_gap",
+    "macro_f1_std",
+    "max_bal_acc",
+    "min_bal_acc",
+    "bal_acc_gap",
+    "bal_acc_std",
+    *[f"balanced_acc_client{k}" for k in range(NUM_CLIENTS)],
     *[f"macro_f1_client{k}" for k in range(NUM_CLIENTS)],
     *[f"macro_f1_fixed8_client{k}" for k in range(NUM_CLIENTS)],
     "weight_divergence",
@@ -49,10 +59,10 @@ CSV_FIELDS = [
 # resume 시 기존 체크포인트와 반드시 일치해야 하는 실험 설정 키
 RESUME_CONFIG_KEYS = [
     "method",
-    "mode",
     "mu",
     "seed",
     "lr",
+    "num_updates",
     "local_epochs",
     "batch_size",
     "val_fraction",
@@ -74,7 +84,7 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fed-ISIC2019 Federated Learning (Centralized / FedAvg / FedProx)"
+        description="Fed-ISIC2019 6-Client Federated Learning (Centralized / FedAvg / FedProx)"
     )
     parser.add_argument(
         "--method",
@@ -84,35 +94,40 @@ def parse_args():
         help="학습 방식 선택: centralized, fedavg, fedprox",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        default="top3",
-        choices=["top3", "merge6"],
-        help="데이터셋 분할 모드: top3 (센터 0,1,2) 또는 merge6 (6개 센터 3분할 병합)",
-    )
-    parser.add_argument(
         "--rounds",
         type=int,
-        default=20,
-        help="총 통신 라운드 수 (centralized의 경우 총 에폭 단위로 동작)",
+        default=None,
+        help=(
+            "총 통신 라운드 수. 미지정(None) 시 FLamby 공식 스케줄 자동 적용: "
+            f"연합학습은 get_nb_max_rounds(num_updates), centralized는 NUM_EPOCHS_POOLED({NUM_EPOCHS_POOLED})"
+        ),
+    )
+    parser.add_argument(
+        "--num_updates",
+        type=int,
+        default=100,
+        help=(
+            "연합학습(fedavg/fedprox)에서 라운드당 클라이언트 로컬 미니배치 업데이트(step) 횟수 "
+            "(FLamby 공식 벤치마크 기본값: 100). 0 이하로 주면 --local_epochs 기반으로 동작"
+        ),
     )
     parser.add_argument(
         "--local_epochs",
         type=int,
-        default=2,
-        help="각 라운드당 클라이언트 로컬 에폭 수 (연합학습 권장: 2, centralized 권장: 1)",
+        default=1,
+        help="centralized의 라운드당 에폭 수 (기본값: 1) 또는 --num_updates <= 0일 때의 로컬 에폭 수",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,
-        help="미니배치 크기",
+        default=BATCH_SIZE,
+        help=f"미니배치 크기 (FLamby 공식 기본값: {BATCH_SIZE})",
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
-        help="학습률 (Learning Rate)",
+        default=LR,
+        help=f"학습률 Learning Rate (FLamby 공식 기본값: {LR})",
     )
     parser.add_argument(
         "--mu",
@@ -307,9 +322,11 @@ def _run_final_test(
 
     _atomic_write_text(json_path, json.dumps(result, indent=2, ensure_ascii=False))
     print(
-        f"[Final Test] Bal Acc: {final_metrics['balanced_acc']:.4f} | "
-        f"Macro F1: {final_metrics['macro_f1']:.4f} | ECE: {final_metrics['ece']:.4f} | "
-        f"Gap: {final_metrics['macro_f1_gap']:.4f} → {json_path}"
+        f"[Final Test] Bal Acc: {final_metrics['balanced_acc']:.4f} "
+        f"(Client Std: {final_metrics['bal_acc_std']:.4f}, Gap: {final_metrics['bal_acc_gap']:.4f}) | "
+        f"Macro F1: {final_metrics['macro_f1']:.4f} "
+        f"(Client Std: {final_metrics['macro_f1_std']:.4f}, Gap: {final_metrics['macro_f1_gap']:.4f}) | "
+        f"ECE: {final_metrics['ece']:.4f} → {json_path}"
     )
 
 
@@ -318,18 +335,34 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # FLamby 공식 벤치마크 학습 스케줄 결정
+    if args.method == "centralized":
+        effective_num_updates = None
+        if args.rounds is None:
+            args.rounds = NUM_EPOCHS_POOLED
+    else:
+        effective_num_updates = args.num_updates if args.num_updates > 0 else None
+        if args.rounds is None:
+            if effective_num_updates is not None:
+                args.rounds = get_nb_max_rounds(effective_num_updates, batch_size=args.batch_size)
+            else:
+                args.rounds = NUM_EPOCHS_POOLED
+
     effective_mu = args.mu if args.method == "fedprox" else 0.0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] Using device: {device} | Seed: {args.seed}")
+    schedule_desc = (
+        f"Num Updates/Round: {effective_num_updates}"
+        if effective_num_updates is not None
+        else f"Local Epochs/Round: {args.local_epochs}"
+    )
     print(
-        f"[Info] Method: {args.method} | Mode: {args.mode} | Rounds: {args.rounds} | "
-        f"Local Epochs: {args.local_epochs} | Batch Size: {args.batch_size} | "
-        f"LR: {args.lr} | Mu: {effective_mu}"
+        f"[Info] Method: {args.method} | Clients: {NUM_CLIENTS} | Rounds: {args.rounds} | "
+        f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} | Mu: {effective_mu}"
     )
 
-    # 1. DataLoader 준비
+    # 1. DataLoader 준비 (FLamby 공식 6개 센터: Center 0 ~ 5)
     client_loaders, centralized_loader, val_loader, test_loader = get_dataloaders(
-        mode=args.mode,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         data_path=args.data_path,
@@ -344,6 +377,9 @@ def main():
             f"클라이언트 수({num_clients})가 CSV 열 정의(NUM_CLIENTS={NUM_CLIENTS})와 다릅니다."
         )
     client_sample_counts = [len(loader.dataset) for loader in client_loaders]
+    # FLamby DataLoaderWithMemory와 동일하게 라운드 간 반복자 상태를 유지하는 래퍼
+    client_step_iterators = [ClientStepIterator(loader) for loader in client_loaders]
+
     print(f"[Info] Number of clients: {num_clients} | Client samples: {client_sample_counts}")
     print(
         f"[Info] Centralized train samples: {len(centralized_loader.dataset)} | "
@@ -351,21 +387,8 @@ def main():
         f"(val_fraction={args.val_fraction}, split_seed={args.split_seed})"
     )
 
-    # 2. 클래스 불균형 해소를 위한 역빈도 가중치 계산
-    if args.method == "centralized":
-        class_weights = compute_class_weights(centralized_loader, num_classes=8, device=device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        client_criteria = None
-    else:
-        # 각 클라이언트의 로컬 클래스 분포에 맞춘 역빈도 가중치 (전체 통합 가중치로 평가)
-        client_criteria = [
-            nn.CrossEntropyLoss(
-                weight=compute_class_weights(loader, num_classes=8, device=device)
-            )
-            for loader in client_loaders
-        ]
-        eval_weights = compute_class_weights(centralized_loader, num_classes=8, device=device)
-        criterion = nn.CrossEntropyLoss(weight=eval_weights)
+    # 2. FLamby 공식 손실 함수 (BaselineLoss: Weighted Focal Loss) 초기화
+    criterion = build_baseline_loss(device=device)
 
     # 3. 글로벌 모델 초기화 및 1라운드당 통신량(MB) 계산
     global_model = build_efficientnet_b0(num_classes=8, pretrained=True).to(device)
@@ -390,9 +413,9 @@ def main():
 
     # 4. 결과 기록용 CSV 및 모델 저장 경로 설정 (시드 및 FedProx mu 값 구분)
     if args.method == "fedprox":
-        exp_tag = f"{args.method}_mu{effective_mu:g}_{args.mode}"
+        exp_tag = f"{args.method}_mu{effective_mu:g}"
     else:
-        exp_tag = f"{args.method}_{args.mode}"
+        exp_tag = f"{args.method}"
 
     csv_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_metrics.csv")
     best_model_path = os.path.join(args.save_dir, f"best_{exp_tag}_seed{args.seed}.pt")
@@ -400,10 +423,11 @@ def main():
 
     run_config = {
         "method": args.method,
-        "mode": args.mode,
         "mu": effective_mu,
         "seed": args.seed,
         "lr": args.lr,
+        "rounds": args.rounds,
+        "num_updates": effective_num_updates,
         "local_epochs": args.local_epochs,
         "batch_size": args.batch_size,
         "val_fraction": args.val_fraction,
@@ -466,6 +490,7 @@ def main():
                 mu=0.0,
                 global_model=None,
                 optimizer=central_optimizer,
+                num_updates=None,
             )
             # Centralized는 단일 글로벌 모델만 존재하므로 클라이언트 간 가중치 발산(Client Drift)은 0.0
             avg_divergence = 0.0
@@ -474,17 +499,18 @@ def main():
             local_losses = []
             divergences = []
 
-            for client_idx, loader in enumerate(client_loaders):
+            for step_iter in client_step_iterators:
                 local_model = copy.deepcopy(global_model)
                 trained_local_model, c_loss = train_one_client(
                     model=local_model,
-                    dataloader=loader,
-                    criterion=client_criteria[client_idx],
+                    dataloader=step_iter,
+                    criterion=criterion,
                     lr=args.lr,
                     local_epochs=args.local_epochs,
                     device=device,
                     mu=effective_mu,
                     global_model=global_model,
+                    num_updates=effective_num_updates,
                 )
 
                 div = compute_weight_divergence(global_model, trained_local_model)
@@ -492,7 +518,7 @@ def main():
                 local_losses.append(c_loss)
                 divergences.append(div)
 
-            # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(CE 기준) 계산
+            # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(BaselineLoss 기준) 계산
             total_samples = sum(client_sample_counts)
             train_loss = sum(
                 l * n for l, n in zip(local_losses, client_sample_counts)
@@ -520,15 +546,21 @@ def main():
         max_macro_f1 = eval_metrics["max_macro_f1"]
         min_macro_f1 = eval_metrics["min_macro_f1"]
         macro_f1_gap = eval_metrics["macro_f1_gap"]
+        macro_f1_std = eval_metrics["macro_f1_std"]
+        max_bal_acc = eval_metrics["max_bal_acc"]
+        min_bal_acc = eval_metrics["min_bal_acc"]
+        bal_acc_gap = eval_metrics["bal_acc_gap"]
+        bal_acc_std = eval_metrics["bal_acc_std"]
+        client_bal_acc = eval_metrics["client_balanced_acc"]
         client_f1 = eval_metrics["client_macro_f1"]
         client_f1_fixed8 = eval_metrics["client_macro_f1_fixed8"]
         cumulative_comm_mb = r * round_comm_mb
 
         print(
             f"[Round {r:03d}/{args.rounds:03d}] "
-            f"Train CE: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Bal Acc: {balanced_acc:.4f} | Macro F1: {macro_f1:.4f} "
-            f"(Gap: {macro_f1_gap:.4f} [{min_macro_f1:.4f}~{max_macro_f1:.4f}]) | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Bal Acc: {balanced_acc:.4f} (Std: {bal_acc_std:.4f}, Gap: {bal_acc_gap:.4f}) | "
+            f"Macro F1: {macro_f1:.4f} (Std: {macro_f1_std:.4f}, Gap: {macro_f1_gap:.4f}) | "
             f"ECE: {ece:.4f} | Weight Div: {avg_divergence:.4f} | "
             f"Comm: {cumulative_comm_mb:.1f} MB"
         )
@@ -537,7 +569,6 @@ def main():
         row_data = {
             "round": r,
             "method": args.method,
-            "mode": args.mode,
             "mu": effective_mu,
             "seed": args.seed,
             "eval_split": "val",
@@ -550,14 +581,21 @@ def main():
             "max_macro_f1": round(max_macro_f1, 6),
             "min_macro_f1": round(min_macro_f1, 6),
             "macro_f1_gap": round(macro_f1_gap, 6),
+            "macro_f1_std": round(macro_f1_std, 6),
+            "max_bal_acc": round(max_bal_acc, 6),
+            "min_bal_acc": round(min_bal_acc, 6),
+            "bal_acc_gap": round(bal_acc_gap, 6),
+            "bal_acc_std": round(bal_acc_std, 6),
             "weight_divergence": round(avg_divergence, 6),
             "cumulative_comm_mb": round(cumulative_comm_mb, 2),
         }
         for k in range(NUM_CLIENTS):
+            row_data[f"balanced_acc_client{k}"] = round(client_bal_acc[k], 6)
             row_data[f"macro_f1_client{k}"] = round(client_f1[k], 6)
             row_data[f"macro_f1_fixed8_client{k}"] = round(client_f1_fixed8[k], 6)
         with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            writer.writeheader() if os.path.getsize(csv_path) == 0 else None
             writer.writerow(row_data)
             f.flush()
 
@@ -574,6 +612,11 @@ def main():
                     "max_macro_f1": max_macro_f1,
                     "min_macro_f1": min_macro_f1,
                     "macro_f1_gap": macro_f1_gap,
+                    "macro_f1_std": macro_f1_std,
+                    "max_bal_acc": max_bal_acc,
+                    "min_bal_acc": min_bal_acc,
+                    "bal_acc_gap": bal_acc_gap,
+                    "bal_acc_std": bal_acc_std,
                     "cumulative_comm_mb": cumulative_comm_mb,
                     "model_state_dict": global_model.state_dict(),
                 },

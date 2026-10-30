@@ -6,6 +6,32 @@ import torch.nn.functional as F
 from torchvision import models
 from sklearn.metrics import balanced_accuracy_score, f1_score
 from tqdm import tqdm
+from flamby.datasets.fed_isic2019 import BaselineLoss
+
+
+class ClientStepIterator:
+    """
+    FLamby의 DataLoaderWithMemory와 동일하게 라운드 간 DataLoader 반복자(iterator) 상태를 유지하며
+    지정된 스텝 수(num_updates)만큼 미니배치를 연속으로 공급하는 래퍼입니다.
+
+    - 에폭 도중 라운드가 끝나면 다음 라운드에서 나머지 배치를 이어서 학습합니다 (대형 센터의 앞부분 배치 편향 방지).
+    - 데이터셋 끝에 도달하면(StopIteration) 자동으로 새 에폭 반복자를 생성하여 끊김 없이 배치를 반환합니다.
+    """
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self.dataset = dataloader.dataset
+        self._iterator = None
+
+    def get_next_batch(self):
+        if self._iterator is None:
+            self._iterator = iter(self.dataloader)
+        try:
+            batch = next(self._iterator)
+        except StopIteration:
+            self._iterator = iter(self.dataloader)
+            batch = next(self._iterator)
+        return batch
 
 
 def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.Module:
@@ -22,6 +48,27 @@ def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.M
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, num_classes)
     return model
+
+
+def _sync_criterion_device(criterion: nn.Module, device: torch.device | str) -> nn.Module:
+    """
+    BaselineLoss 내부에 버퍼로 등록되지 않은 일반 텐서 속성(예: self.alpha 등)까지
+    재귀적으로 탐색하여 지정된 디바이스로 이동시킵니다.
+    """
+    criterion = criterion.to(device)
+    for module in criterion.modules():
+        for attr_name, attr_val in list(vars(module).items()):
+            if isinstance(attr_val, torch.Tensor) and attr_val.device != torch.device(device):
+                setattr(module, attr_name, attr_val.to(device))
+    return criterion
+
+
+def build_baseline_loss(device: torch.device | str = "cpu") -> nn.Module:
+    """
+    FLamby Fed-ISIC2019 공식 BaselineLoss (Weighted Focal Loss)를 생성하고 디바이스를 맞춥니다.
+    """
+    criterion = BaselineLoss()
+    return _sync_criterion_device(criterion, device)
 
 
 def compute_weight_divergence(global_model: nn.Module, local_model: nn.Module) -> float:
@@ -65,35 +112,40 @@ def train_one_client(
     dataloader,
     criterion: nn.Module,
     lr: float,
-    local_epochs: int,
-    device: torch.device | str,
+    local_epochs: int = 1,
+    device: torch.device | str = "cpu",
     mu: float = 0.0,
     global_model: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
+    num_updates: int | None = None,
 ) -> tuple[nn.Module, float]:
     """
     단일 클라이언트(또는 Centralized) 모델을 학습합니다.
-    - mu == 0.0: FedAvg (표준 Cross-Entropy 학습)
+    - num_updates가 지정된 경우(연합학습 공식 스케줄): 라운드당 정확히 `num_updates` 미니배치 스텝(기본 100 스텝)을 수행합니다.
+    - num_updates가 None인 경우(Centralized 공식 스케줄): `local_epochs` 에폭만큼 전체 데이터를 순회합니다.
+    - mu == 0.0: FedAvg (FLamby 공식 BaselineLoss: Weighted Focal Loss 학습)
     - mu > 0.0: FedProx (Objective에 (mu / 2) * ||w - w_global||_2^2 정규화 항 추가)
 
     Args:
         model: 학습할 로컬 모델
-        dataloader: 클라이언트 학습 DataLoader
-        criterion: 손실 함수 (예: 가중 CrossEntropyLoss)
-        lr: 학습률
-        local_epochs: 로컬 에폭 수
+        dataloader: 클라이언트 학습 DataLoader 또는 ClientStepIterator
+        criterion: 손실 함수 (FLamby BaselineLoss — Weighted Focal Loss)
+        lr: 학습률 (FLamby 공식 기본값: 5e-4)
+        local_epochs: 로컬 에폭 수 (num_updates가 None일 때 사용)
         device: 학습 디바이스
         mu: FedProx 근접 항 계수 (0.0이면 FedAvg)
         global_model: FedProx 기준이 되는 글로벌 모델 (None이면 학습 시작 시점의 model 스냅샷 사용)
         optimizer: 외부에서 유지하는 옵티마이저 (Centralized처럼 에폭 간 Adam 상태를 유지해야 할 때 전달).
                    None이면 호출 시마다 새 Adam을 생성 (연합학습 로컬 학습의 표준 방식)
+        num_updates: 라운드당 로컬 업데이트(미니배치 스텝) 횟수. FLamby 공식 벤치마크는 100을 사용
 
     Returns:
-        tuple: (학습된 local_model, 평균 train CE loss)
-            - 반환 손실은 근접 항을 제외한 순수 CE 손실이므로 FedAvg/FedProx 간 직접 비교 가능
+        tuple: (학습된 local_model, 평균 train loss)
+            - 반환 손실은 근접 항을 제외한 순수 분류 손실(BaselineLoss)이므로 FedAvg/FedProx 간 직접 비교 가능
     """
     model.to(device)
     model.train()
+    _sync_criterion_device(criterion, device)
 
     if mu > 0.0:
         if global_model is None:
@@ -106,37 +158,58 @@ def train_one_client(
     if optimizer is None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    total_ce_loss = 0.0
+    total_base_loss = 0.0
     total_samples = 0
 
-    for _ in range(local_epochs):
-        for images, targets in tqdm(dataloader, desc="Local Train", leave=False):
-            # BatchNorm2d는 학습 시 미니배치 크기가 1이면 분산 계산 불가로 에러가 발생하므로 방어 처리
-            if images.size(0) == 1:
-                continue
+    def _run_batch(images, targets) -> bool:
+        nonlocal total_base_loss, total_samples
+        # BatchNorm2d는 학습 시 미니배치 크기가 1이면 분산 계산 불가로 에러가 발생하므로 방어 처리
+        if images.size(0) == 1:
+            return False
 
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True).long().view(-1)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True).long().view(-1)
 
-            optimizer.zero_grad()
-            logits = model(images)
-            ce_loss = criterion(logits, targets)
-            loss = ce_loss
+        optimizer.zero_grad()
+        logits = model(images)
+        base_loss = criterion(logits, targets)
+        loss = base_loss
 
-            if mu > 0.0 and global_params is not None:
-                prox_term = torch.tensor(0.0, device=device)
-                for local_p, global_p in zip(model.parameters(), global_params):
-                    prox_term = prox_term + torch.sum((local_p - global_p) ** 2)
-                loss = loss + (mu / 2.0) * prox_term
+        if mu > 0.0 and global_params is not None:
+            prox_term = torch.tensor(0.0, device=device)
+            for local_p, global_p in zip(model.parameters(), global_params):
+                prox_term = prox_term + torch.sum((local_p - global_p) ** 2)
+            loss = loss + (mu / 2.0) * prox_term
 
-            loss.backward()
-            optimizer.step()
+        loss.backward()
+        optimizer.step()
 
-            batch_size = images.size(0)
-            total_ce_loss += ce_loss.item() * batch_size
-            total_samples += batch_size
+        batch_size = images.size(0)
+        total_base_loss += base_loss.item() * batch_size
+        total_samples += batch_size
+        return True
 
-    avg_loss = total_ce_loss / max(total_samples, 1)
+    if num_updates is not None and num_updates > 0:
+        step_iter = (
+            dataloader
+            if isinstance(dataloader, ClientStepIterator)
+            else ClientStepIterator(dataloader)
+        )
+        done_steps = 0
+        pbar = tqdm(total=num_updates, desc=f"Local Train ({num_updates} steps)", leave=False)
+        while done_steps < num_updates:
+            images, targets = step_iter.get_next_batch()
+            if _run_batch(images, targets):
+                done_steps += 1
+                pbar.update(1)
+        pbar.close()
+    else:
+        raw_loader = dataloader.dataloader if isinstance(dataloader, ClientStepIterator) else dataloader
+        for _ in range(local_epochs):
+            for images, targets in tqdm(raw_loader, desc="Local Train (Epoch)", leave=False):
+                _run_batch(images, targets)
+
+    avg_loss = total_base_loss / max(total_samples, 1)
     return model, avg_loss
 
 
@@ -236,6 +309,8 @@ def _collect_predictions(
     desc: str = "Evaluating",
 ):
     """데이터로더에 대해 손실, 예측 확률, 예측 클래스, 정답 레이블을 수집합니다."""
+    _sync_criterion_device(criterion, device)
+
     total_loss = 0.0
     total_samples = 0
     all_probs = []
@@ -288,20 +363,14 @@ def evaluate_model(
 ) -> dict:
     """
     DataLoader(검증 또는 테스트)에서 모델을 평가하여
-    Balanced Accuracy, Macro F1-Score, ECE(Expected Calibration Error),
-    그리고 클라이언트별 최고-최저 Macro-F1 격차(Fairness 지표)를 계산합니다.
+    Global 지표(Balanced Accuracy, Macro F1-Score, ECE) 및
+    6개 클라이언트별 공정성 지표(병원별 Macro-F1 / Balanced Accuracy, 최고-최저 Gap, 병원 간 표준편차 Std)를 계산합니다.
 
     Macro-F1은 두 가지 방식으로 계산합니다.
     - `macro_f1` / 클라이언트별 `client_macro_f1`: 해당 평가셋의 정답에 실제로 존재하는 클래스만 평균 (주 지표).
       병원마다 보유 클래스가 다르므로 "없는 클래스 때문에 F1이 0으로 들어가는" 왜곡을 피합니다.
-      max/min/gap도 이 값으로 계산합니다.
+      max/min/gap/std도 이 값으로 계산합니다.
     - `macro_f1_fixed8` / `client_macro_f1_fixed8`: 클래스 0~(num_classes-1) 전부 평균 (보조 지표).
-
-    Args:
-        client_eval_loaders: 클라이언트별 평가 로더. None이면 dataloader의 `client_eval_loaders`
-            (없으면 `client_test_loaders`) 속성을 사용
-        return_predictions: True면 결과에 `predictions`(y_true, y_pred, y_prob, client_idx)를 포함
-            (최종 test 예측 저장 및 bootstrap 신뢰구간 계산용)
 
     Returns:
         dict: {
@@ -313,8 +382,14 @@ def evaluate_model(
             "max_macro_f1": float,
             "min_macro_f1": float,
             "macro_f1_gap": float,
+            "macro_f1_std": float,
+            "max_bal_acc": float,
+            "min_bal_acc": float,
+            "bal_acc_gap": float,
+            "bal_acc_std": float,
             "client_macro_f1": list[float],
             "client_macro_f1_fixed8": list[float],
+            "client_balanced_acc": list[float],
             ("predictions": dict)
         }
     """
@@ -322,7 +397,7 @@ def evaluate_model(
     model.eval()
 
     if criterion is None:
-        criterion = nn.CrossEntropyLoss()
+        criterion = build_baseline_loss(device=device)
 
     if client_eval_loaders is None:
         client_eval_loaders = getattr(dataloader, "client_eval_loaders", None) or getattr(
@@ -332,6 +407,7 @@ def evaluate_model(
     all_labels = list(range(num_classes))
     client_f1s: list[float] = []
     client_f1s_fixed8: list[float] = []
+    client_bal_accs: list[float] = []
     client_idx = None
 
     # 클라이언트별 로더가 존재하면 단 1번의 순회로 클라이언트별 지표와 Global 통합 지표를 동시에 계산 (중복 추론 방지)
@@ -349,6 +425,7 @@ def evaluate_model(
             )
             client_f1s.append(_macro_f1(c_true, c_pred, np.unique(c_true)))
             client_f1s_fixed8.append(_macro_f1(c_true, c_pred, all_labels))
+            client_bal_accs.append(float(balanced_accuracy_score(c_true, c_pred)))
 
             n_c = len(c_true)
             total_loss_sum += c_loss * n_c
@@ -367,6 +444,12 @@ def evaluate_model(
         max_macro_f1 = float(max(client_f1s))
         min_macro_f1 = float(min(client_f1s))
         macro_f1_gap = float(max_macro_f1 - min_macro_f1)
+        macro_f1_std = float(np.std(client_f1s, ddof=1)) if len(client_f1s) > 1 else 0.0
+
+        max_bal_acc = float(max(client_bal_accs))
+        min_bal_acc = float(min(client_bal_accs))
+        bal_acc_gap = float(max_bal_acc - min_bal_acc)
+        bal_acc_std = float(np.std(client_bal_accs, ddof=1)) if len(client_bal_accs) > 1 else 0.0
     else:
         # 클라이언트별 로더가 없으면 클라이언트 간 공정성 지표를 정의할 수 없으므로 NaN으로 기록
         avg_loss, y_prob, y_pred, y_true = _collect_predictions(
@@ -375,6 +458,11 @@ def evaluate_model(
         max_macro_f1 = float("nan")
         min_macro_f1 = float("nan")
         macro_f1_gap = float("nan")
+        macro_f1_std = float("nan")
+        max_bal_acc = float("nan")
+        min_bal_acc = float("nan")
+        bal_acc_gap = float("nan")
+        bal_acc_std = float("nan")
 
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
     macro_f1 = _macro_f1(y_true, y_pred, np.unique(y_true))
@@ -390,8 +478,14 @@ def evaluate_model(
         "max_macro_f1": max_macro_f1,
         "min_macro_f1": min_macro_f1,
         "macro_f1_gap": macro_f1_gap,
+        "macro_f1_std": macro_f1_std,
+        "max_bal_acc": max_bal_acc,
+        "min_bal_acc": min_bal_acc,
+        "bal_acc_gap": bal_acc_gap,
+        "bal_acc_std": bal_acc_std,
         "client_macro_f1": client_f1s,
         "client_macro_f1_fixed8": client_f1s_fixed8,
+        "client_balanced_acc": client_bal_accs,
     }
     if return_predictions:
         result["predictions"] = {

@@ -3,7 +3,15 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
-from flamby.datasets.fed_isic2019 import FedIsic2019
+from flamby.datasets.fed_isic2019 import (
+    BATCH_SIZE,
+    LR,
+    NUM_CLIENTS,
+    NUM_EPOCHS_POOLED,
+    BaselineLoss,
+    FedIsic2019,
+    get_nb_max_rounds,
+)
 
 
 def _seed_worker(worker_id: int):
@@ -78,56 +86,6 @@ def stratified_train_val_split(
     return train_idx, val_idx
 
 
-def compute_class_weights(
-    data_source,
-    num_classes: int = 8,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    """
-    역빈도(Inverse-Frequency) 기반 클래스 가중치를 계산합니다.
-    w_c = N / (K * n_c)
-
-    Args:
-        data_source: Dataset, DataLoader, 또는 이들의 리스트/반복자, 혹은 레이블 배열
-        num_classes: 전체 클래스 개수 (Fed-ISIC2019 기본값: 8)
-        device: 반환할 텐서의 디바이스
-
-    Returns:
-        torch.Tensor: shape (num_classes,), dtype=torch.float32
-    """
-    if isinstance(data_source, DataLoader):
-        labels = _extract_labels_from_dataset(data_source.dataset)
-    elif isinstance(data_source, Dataset):
-        labels = _extract_labels_from_dataset(data_source)
-    elif isinstance(data_source, (list, tuple)):
-        extracted = []
-        for item in data_source:
-            if isinstance(item, DataLoader):
-                extracted.append(_extract_labels_from_dataset(item.dataset))
-            elif isinstance(item, Dataset):
-                extracted.append(_extract_labels_from_dataset(item))
-            else:
-                extracted.append(np.asarray(item, dtype=np.int64).reshape(-1))
-        labels = np.concatenate(extracted)
-    else:
-        labels = np.asarray(data_source, dtype=np.int64).reshape(-1)
-
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
-    total_samples = float(len(labels))
-
-    # 특정 클래스 샘플 수가 0인 경우 division by zero 방지
-    safe_counts = np.where(counts > 0, counts, 1.0)
-    weights = total_samples / (num_classes * safe_counts)
-    weights = np.where(counts > 0, weights, 0.0)
-
-    # 존재하는 클래스(counts > 0)들의 가중치 평균이 1이 되도록 정규화 (결측 클래스가 있는 병원 간 손실 스케일 통일)
-    present_mask = counts > 0
-    if np.any(present_mask):
-        weights = weights / weights[present_mask].mean()
-
-    return torch.tensor(weights, dtype=torch.float32, device=device)
-
-
 def _build_center_datasets(
     center: int,
     flamby_kwargs: dict,
@@ -152,8 +110,7 @@ def _build_center_datasets(
 
 
 def get_dataloaders(
-    mode: str = "top3",
-    batch_size: int = 32,
+    batch_size: int = BATCH_SIZE,
     num_workers: int = 4,
     data_path: str | None = None,
     debug: bool = False,
@@ -162,15 +119,15 @@ def get_dataloaders(
     split_seed: int = 0,
 ):
     """
-    FLamby의 FedIsic2019 데이터셋을 사용해 클라이언트별 DataLoader,
-    Centralized 통합 DataLoader, Global Validation/Test DataLoader를 생성합니다.
+    FLamby의 FedIsic2019 공식 6개 센터(Center 0 ~ 5) 데이터셋을 사용해
+    6개 클라이언트별 DataLoader, Centralized 통합 DataLoader,
+    Global Validation/Test DataLoader를 생성합니다.
 
     각 센터의 FLamby train 데이터를 층화로 (1 - val_fraction) : val_fraction 으로 나눠
     학습/검증으로 쓰고, FLamby 공식 test는 최종 평가에만 사용합니다.
 
     Args:
-        mode: 'top3' (센터 0, 1, 2 사용) 또는 'merge6' (6개 센터를 3개 클라이언트로 병합)
-        batch_size: 미니배치 크기
+        batch_size: 미니배치 크기 (FLamby 공식 기본값: BATCH_SIZE = 64)
         num_workers: DataLoader 워커 프로세스 수
         data_path: FLamby 데이터 경로 (None이면 FLamby 기본 설정 사용)
         debug: FLamby debug 모드 여부
@@ -180,52 +137,34 @@ def get_dataloaders(
 
     Returns:
         tuple: (client_loaders, centralized_loader, val_loader, test_loader)
-            - client_loaders ( list[DataLoader] ): 3개 클라이언트의 학습용 DataLoader 리스트
-            - centralized_loader ( DataLoader ): 전체 학습 데이터를 하나로 묶은 통합 DataLoader
+            - client_loaders ( list[DataLoader] ): 6개 클라이언트(센터 0~5)의 학습용 DataLoader 리스트
+            - centralized_loader ( DataLoader ): 전체 6개 센터 학습 데이터를 하나로 묶은 통합 DataLoader
             - val_loader ( DataLoader ): 글로벌 검증용 통합 DataLoader (매 라운드 평가·모델/mu 선택용)
             - test_loader ( DataLoader ): 글로벌 최종 평가용 통합 Test DataLoader (마지막에 1회만 사용)
-            val_loader와 test_loader에는 클라이언트별 평가 로더 리스트가 `client_eval_loaders` 속성으로
+            val_loader와 test_loader에는 6개 클라이언트별 평가 로더 리스트가 `client_eval_loaders` 속성으로
             연결되어 있습니다.
     """
-    mode = mode.lower().strip()
-    if mode not in ("top3", "merge6"):
-        raise ValueError(f"지원하지 않는 mode입니다: {mode}. 'top3' 또는 'merge6'을 사용하세요.")
-
     flamby_kwargs = {}
     if "debug" in inspect.signature(FedIsic2019.__init__).parameters:
         flamby_kwargs["debug"] = debug
     if data_path is not None:
         flamby_kwargs["data_path"] = data_path
 
-    if mode == "top3":
-        # 상위 3개 주요 센터 (센터 0, 1, 2)
-        center_groups = [(0,), (1,), (2,)]
-    else:
-        # mode == 'merge6': 전체 6개 센터(0~5)를 3개 클라이언트로 병합
-        # 대형 센터(0, 1, 2) 각각에 소형 센터(3, 4, 5)를 페어링하여 3개 클라이언트로 구성
-        center_groups = [(0, 3), (1, 4), (2, 5)]
-
     client_datasets = []
     client_val_datasets = []
     client_test_datasets = []
-    for group in center_groups:
-        parts = [
-            _build_center_datasets(c, flamby_kwargs, val_fraction, split_seed) for c in group
-        ]
-        trains, vals, tests = zip(*parts)
-        if len(group) == 1:
-            client_datasets.append(trains[0])
-            client_val_datasets.append(vals[0])
-            client_test_datasets.append(tests[0])
-        else:
-            client_datasets.append(ConcatDataset(list(trains)))
-            client_val_datasets.append(ConcatDataset(list(vals)))
-            client_test_datasets.append(ConcatDataset(list(tests)))
+    for center in range(NUM_CLIENTS):
+        train_ds, val_ds, test_ds = _build_center_datasets(
+            center, flamby_kwargs, val_fraction, split_seed
+        )
+        client_datasets.append(train_ds)
+        client_val_datasets.append(val_ds)
+        client_test_datasets.append(test_ds)
 
     pin_memory = torch.cuda.is_available()
     worker_init_fn = _seed_worker if seed is not None else None
 
-    # 1. 3개 클라이언트 학습 DataLoader
+    # 1. 6개 클라이언트(센터 0~5) 학습 DataLoader
     client_loaders = []
     for idx, ds in enumerate(client_datasets):
         gen = None
@@ -272,15 +211,13 @@ def get_dataloaders(
             drop_last=False,
         )
 
-    # 3. Global Validation/Test DataLoader (활성 클라이언트 데이터 통합) 및 클라이언트별 평가 DataLoader
-    # top3 모드에서는 센터 0,1,2의 통합 셋, merge6 모드에서는 전체 6개 센터(0~5)의 통합 셋으로 일치시킴
+    # 3. Global Validation/Test DataLoader (전체 6개 센터 통합) 및 클라이언트별 평가 DataLoader
     # 클라이언트 간 최고-최저 Macro-F1(공정성 지표) 계산을 위해 클라이언트별 로더를 속성으로 연결
     val_loader = _make_eval_loader(ConcatDataset(client_val_datasets))
     val_loader.client_eval_loaders = [_make_eval_loader(ds) for ds in client_val_datasets]
 
     test_loader = _make_eval_loader(ConcatDataset(client_test_datasets))
     test_loader.client_eval_loaders = [_make_eval_loader(ds) for ds in client_test_datasets]
-    # 기존 코드/노트북과의 호환을 위한 별칭
     test_loader.client_test_loaders = test_loader.client_eval_loaders
 
     return client_loaders, centralized_loader, val_loader, test_loader
