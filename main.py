@@ -3,7 +3,10 @@ import copy
 import csv
 import json
 import os
+import platform
 import random
+import subprocess
+import sys
 import numpy as np
 import torch
 
@@ -68,6 +71,48 @@ RESUME_CONFIG_KEYS = [
     "val_fraction",
     "split_seed",
 ]
+
+
+def _collect_env_info() -> dict:
+    """재현성 점검용 환경 정보 (라이브러리 버전, 프로젝트·FLamby 커밋)."""
+    import importlib
+
+    def _version(name):
+        try:
+            return getattr(importlib.import_module(name), "__version__", "unknown")
+        except Exception:
+            return None
+
+    def _git_head(path):
+        try:
+            return subprocess.check_output(
+                ["git", "-C", path, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            return None
+
+    flamby_dir = None
+    try:
+        import flamby
+
+        flamby_dir = os.path.dirname(os.path.dirname(os.path.abspath(flamby.__file__)))
+    except Exception:
+        pass
+
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "torchvision": _version("torchvision"),
+        "sklearn": _version("sklearn"),
+        "numpy": np.__version__,
+        "pandas": _version("pandas"),
+        "albumentations": _version("albumentations"),
+        "project_commit": _git_head(os.path.dirname(os.path.abspath(__file__))),
+        "flamby_commit": _git_head(flamby_dir) if flamby_dir else None,
+    }
 
 
 def set_seed(seed: int):
@@ -270,6 +315,15 @@ def _run_final_test(
     json_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_final_test.json")
     npz_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_final_test_preds.npz")
     if os.path.exists(json_path):
+        with open(json_path, encoding="utf-8") as f:
+            saved_config = json.load(f).get("config", {})
+        changed = [k for k in saved_config if k in run_config and saved_config[k] != run_config[k]]
+        if changed:
+            raise ValueError(
+                f"[Final Test] 기존 결과 파일의 설정과 현재 설정이 다릅니다: "
+                + ", ".join(f"{k} (saved={saved_config[k]}, now={run_config[k]})" for k in changed)
+                + f". 다른 실험이면 --save_dir을 분리하고, 같은 실험을 다시 평가하려면 {json_path}를 직접 옮긴 뒤 실행하세요."
+            )
         print(f"[Final Test] 이미 결과가 있어 test를 다시 평가하지 않습니다: {json_path}")
         return
 
@@ -434,6 +488,15 @@ def main():
         "split_seed": args.split_seed,
     }
 
+    env_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_env.json")
+    # 세션마다(재개 포함) 환경을 한 항목씩 누적 기록: 중간에 GPU나 라이브러리가 바뀐 실행을 나중에 식별하기 위함
+    env_log = {"config": run_config, "sessions": []}
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            env_log = json.load(f)
+    env_log["sessions"].append({"resume": bool(args.resume), "env": _collect_env_info()})
+    _atomic_write_text(env_path, json.dumps(env_log, indent=2, ensure_ascii=False))
+
     start_round = 1
     best_balanced_acc = -1.0
 
@@ -460,6 +523,12 @@ def main():
         best_balanced_acc = ckpt["best_balanced_acc"]
         start_round = ckpt["round"] + 1
         _restore_rng_states(ckpt["rng_states"], client_loaders, centralized_loader)
+        iterator_states = ckpt.get("client_iterator_states")
+        if iterator_states is not None and args.method != "centralized":
+            for step_iter, st in zip(client_step_iterators, iterator_states):
+                step_iter.load_state_dict(st)
+        elif args.method != "centralized":
+            print("[Resume Warning] 체크포인트에 반복자 위치가 없어 에폭 중간부터 이어가지 못합니다 (구버전 체크포인트).")
         _truncate_csv(csv_path, ckpt["round"])
         print(
             f"[Resume] {last_ckpt_path} 로드 완료 → Round {start_round}부터 재개 "
@@ -637,6 +706,8 @@ def main():
                     central_optimizer.state_dict() if central_optimizer is not None else None
                 ),
                 "rng_states": _capture_rng_states(client_loaders, centralized_loader),
+                # 에폭 중간에서 끝난 라운드를 정확히 이어가기 위한 클라이언트 반복자 위치
+                "client_iterator_states": [it.state_dict() for it in client_step_iterators],
             },
             last_ckpt_path,
         )

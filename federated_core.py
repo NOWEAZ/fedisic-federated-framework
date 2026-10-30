@@ -22,16 +22,55 @@ class ClientStepIterator:
         self.dataloader = dataloader
         self.dataset = dataloader.dataset
         self._iterator = None
+        # resume 시 에폭 중간 위치를 정확히 복원하기 위한 기록: 현재 에폭 시작 직전의 generator 상태와 소비한 배치 수
+        self._epoch_start_gen_state = None
+        self._consumed = 0
+
+    def _new_epoch_iterator(self):
+        gen = getattr(self.dataloader, "generator", None)
+        self._epoch_start_gen_state = gen.get_state() if gen is not None else None
+        self._consumed = 0
+        self._iterator = iter(self.dataloader)
 
     def get_next_batch(self):
         if self._iterator is None:
-            self._iterator = iter(self.dataloader)
+            self._new_epoch_iterator()
         try:
             batch = next(self._iterator)
         except StopIteration:
-            self._iterator = iter(self.dataloader)
+            self._new_epoch_iterator()
             batch = next(self._iterator)
+        self._consumed += 1
         return batch
+
+    def state_dict(self) -> dict:
+        """현재 에폭의 시작 상태와 소비한 배치 수 (체크포인트 저장용)."""
+        return {
+            "epoch_start_gen_state": self._epoch_start_gen_state,
+            "consumed": self._consumed,
+        }
+
+    def load_state_dict(self, state: dict):
+        """
+        에폭 시작 시점의 generator 상태로 되돌려 같은 순열의 반복자를 만들고, 이미 소비한 배치만큼 건너뜁니다.
+        (건너뛰는 배치도 워커가 같은 순서로 처리하므로 증강 난수까지 끊기지 않았을 때와 같아집니다.)
+        호출 후 generator 상태는 저장 시점과 같아집니다.
+        """
+        gen = getattr(self.dataloader, "generator", None)
+        start_state = state.get("epoch_start_gen_state")
+        consumed = int(state.get("consumed", 0))
+        if gen is None or start_state is None:
+            self._iterator = None
+            self._epoch_start_gen_state = None
+            self._consumed = 0
+            return
+        gen.set_state(start_state.cpu())
+        self._epoch_start_gen_state = gen.get_state()
+        self._iterator = iter(self.dataloader)
+        self._consumed = 0
+        for _ in range(consumed):
+            next(self._iterator)
+            self._consumed += 1
 
 
 def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.Module:

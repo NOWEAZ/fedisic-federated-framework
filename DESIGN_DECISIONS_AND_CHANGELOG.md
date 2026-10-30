@@ -15,7 +15,7 @@
 | **5** | **데이터 분할 및 평가 프로토콜** | 센터별 **층화 90/10 Train/Val 분할** 및 학습 종료 후 **`--final_test` 단 1회 평가** | 매 라운드 모니터링·모델 선택·$\mu$ 튜닝을 Validation으로만 수행하여 Test 데이터 누수(Test-set Snooping) 및 선택 편향(Selection Bias) 원천 차단 |
 | **6** | **다중 시드 실험 전략** | **2단계 시드 분리** (`seed=41` 탐색 $\rightarrow$ `seed=42, 100, 2026` 본실험) | 하이퍼파라미터($\mu$) 선택 시드와 최종 보고용 3시드를 완전히 분리하여 통계적 엄밀성(`Mean ± Std`) 확보 및 코랩 탐색 시간 절감 |
 | **7** | **다각도 평가지표 체계** | **`Balanced Acc`**, **`Macro-F1`**, 병원별 **`balanced_acc_client0~5` / `macro_f1_client0~5`**, 병원 간 **`macro_f1_std` / `bal_acc_std`** 및 **`Gap`**, **`15-bin ECE`**, **`Weight Divergence`**, **`Cumulative Comm (MB)`** | 불균형 분류 성능뿐만 아니라 초소형 병원 노이즈에 강건한 병원 간 공정성(Fairness: Std & Gap), 신뢰도 보정(Calibration), Client Drift, 통신 효율성을 종합 평가 |
-| **8** | **엔지니어링 최적화 및 안정화** | 단일 패스 추론, `Centralized` 모멘텀 유지, 순수 손실 로깅, `BN` 크기 1 방어, `--resume` 원자적 체크포인트 | 평가 속도 2배 향상, 상한선 공정 비교, 코랩 세션 중단 시 무손실 재개 및 GPU/CPU 디바이스 동기화 보장 |
+| **8** | **엔지니어링 최적화 및 안정화** | 단일 패스 추론, `Centralized` 모멘텀 유지, 순수 손실 로깅, `BN` 크기 1 방어, `--resume` 원자적 체크포인트 | 평가 속도 2배 향상, 상한선 공정 비교, 코랩 세션 중단 시 에폭 중간 위치까지 복원하는 재개 및 GPU/CPU 디바이스 동기화 보장 |
 
 ---
 
@@ -73,7 +73,7 @@
 
 ### 💡 기술적·학술적 근거
 1. **병원 간 로컬 업데이트 스텝 수 균등화**:
-   - 90% 학습 분할 및 `batch_size = 64` 기준, Center 0(약 8,937장)의 1 에폭은 약 **140 스텝**인 반면 Center 5(약 316장)의 1 에폭은 약 **5 스텝**으로 **28배** 차이가 남.
+   - 90% 학습 분할 및 `batch_size = 64` 기준, Center 0(8,937장)의 1 에폭은 약 **140 스텝**인 반면 Center 5(313장)의 1 에폭은 약 **5 스텝**으로 **28배** 차이가 남.
    - 만약 로컬 에폭 수를 고정하면 한 라운드 동안 대형 병원은 140 스텝을 이동하고 소형 병원은 5 스텝만 이동하여 로컬 업데이트 크기 불균형이 발생함. 라운드당 `num_updates = 100` 스텝으로 통일하면 모든 병원이 동일한 경사하강 횟수를 수행한 뒤 집계되므로 공정한 비교가 가능함.
 2. **`ClientStepIterator`를 통한 대형 병원 데이터 편향 방지**:
    - 매 라운드 `iter(dataloader)`를 새로 열면 140 배치를 가진 Center 0은 매번 에폭의 앞쪽 100 배치만 학습하고 뒤쪽 40 배치는 버려지게 됨. `ClientStepIterator`는 이전 라운드가 끝난 배치 위치에서 다음 라운드를 이어서 진행하고, 데이터셋 끝에 도달했을 때만 새 에폭을 시작하여 모든 학습 데이터를 빠짐없이 활용함.
@@ -130,7 +130,7 @@
 
 ### 💡 기술적·학술적 근거 (`Std` 및 병원별 `Bal Acc` 도입 배경)
 1. **초소형 병원(Client 4, Client 5)의 소수 샘플 노이즈 완화**:
-   - 6-클라이언트 환경에서 Client 5는 검증셋이 **약 35장**(테스트셋 88장), Client 4는 검증셋이 **약 65장**(테스트셋 164장)으로 작아, 극단값 2개($\max - \min$)만 보는 `Gap` 지표는 특정 소형 병원의 샘플 몇 장이 바뀔 때 크게 흔들릴 수 있음.
+   - 6-클라이언트 환경에서 Client 5는 검증셋이 **38장**(테스트셋 88장), Client 4는 검증셋이 **66장**(테스트셋 164장)으로 작아, 극단값 2개($\max - \min$)만 보는 `Gap` 지표는 특정 소형 병원의 샘플 몇 장이 바뀔 때 크게 흔들릴 수 있음.
    - 반면 6개 병원 전체의 표준편차인 **`macro_f1_std`와 `bal_acc_std`** 는 연합학습 공정성 문헌(Li et al., *Fair Resource Allocation in Federated Learning*, ICLR 2020)의 표준 지표로서 단일 병원 노이즈에 훨씬 강건하게 병원 간 성능 편차를 반영함.
 2. **FLamby 공식 주 지표(`Balanced Accuracy`)와의 일관성 확보**:
    - Global 주 지표가 `Balanced Accuracy`이므로, 병원별 세부 성능 역시 `macro_f1_client0~5`뿐만 아니라 `balanced_acc_client0~5`와 `bal_acc_std`를 함께 제시함으로써 Global 성능과 병원별 공정성 분석의 기준을 완벽히 일치시킴.
@@ -144,6 +144,6 @@
 | **8.1** | `federated_core.py` | **`evaluate_model` 단일 패스 추론** | 6개 클라이언트별 평가 로더(`client_eval_loaders`)의 추론 결과를 `np.concatenate`하여 Global 지표와 병원별 공정성 지표(`F1` 및 `Bal Acc`의 `Std`/`Gap`)를 한 번의 순회로 동시 산출(평가 시간 50% 단축). |
 | **8.2** | `federated_core.py` | **`BaselineLoss` 재귀적 디바이스 동기화 (`_sync_criterion_device`)** | FLamby `BaselineLoss` 내부에 PyTorch 버퍼로 등록되지 않은 일반 텐서 속성(`self.alpha` 등)을 재귀적으로 탐색해 `CPU`/`CUDA` 디바이스로 이동시켜 런타임 디바이스 불일치 에러 원천 차단. |
 | **8.3** | `federated_core.py` | **`BatchNorm2d` 단일 샘플 배치 방어** | 미니배치 크기가 1일 때(`images.size(0) == 1`) `BatchNorm2d` 분산 계산 에러(`ValueError`)가 발생하지 않도록 건너뛰되, `num_updates` 스텝 카운트는 차감하지 않아 정확한 업데이트 횟수 보장. |
-| **8.4** | `main.py` | **`Centralized`의 Adam 모멘텀 유지 및 `weight_divergence = 0.0` 고정** | 연합학습은 라운드마다 로컬 옵티마이저를 새로 생성하는 표준을 따르되, 상한 기준선인 `Centralized`는 루프 외부의 `central_optimizer`로 에폭 간 모멘텀을 유지함. 또한 `Centralized`의 `weight_divergence`는 `0.0`으로 고정해 Client Drift 그래프 왜곡 방지. |
-| **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·옵티마이저·난수 상태를 저장하며, 저장 도중 연결이 끊겨 파일이 깨지지 않도록 `.tmp` 작성 후 `os.replace`로 교체함. |
+| **8.4** | `main.py` | **`Centralized`의 Adam 모멘텀 유지 및 `weight_divergence = 0.0` 고정** | 연합학습은 라운드마다 로컬 옵티마이저를 새로 생성함(주의: FLamby 공식 FedAvg는 클라이언트 옵티마이저를 라운드 간 유지하므로 이 점은 공식 구현과 다름. 보고서에 "FLamby와 달리 라운드마다 Adam 상태를 초기화"라고 명시할 것). 상한 기준선인 상한 기준선인 `Centralized`는 루프 외부의 `central_optimizer`로 에폭 간 모멘텀을 유지함. 또한 `Centralized`의 `weight_divergence`는 `0.0`으로 고정해 Client Drift 그래프 왜곡 방지. |
+| **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·옵티마이저·난수 상태와 클라이언트별 DataLoader 반복자 위치(에폭 내 소비 배치 수와 에폭 시작 시점 generator 상태)를 저장하며, 저장 도중 연결이 끊겨 파일이 깨지지 않도록 `.tmp` 작성 후 `os.replace`로 교체함. 재개 시 반복자 위치를 복원해 에폭 중간에서 끊긴 라운드도 이어가지만, GPU 비결정 연산 때문에 비트 단위 동일성까지는 보장하지 않음. 세션별 라이브러리·GPU·커밋 정보는 `*_env.json`에 누적 기록함. |
 | **8.6** | `fed_isic2019_colab.ipynb` | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
