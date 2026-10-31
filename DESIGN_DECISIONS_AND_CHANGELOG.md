@@ -144,6 +144,30 @@
 | **8.1** | `federated_core.py` | **`evaluate_model` 단일 패스 추론** | 6개 클라이언트별 평가 로더(`client_eval_loaders`)의 추론 결과를 `np.concatenate`하여 Global 지표와 병원별 공정성 지표(`F1` 및 `Bal Acc`의 `Std`/`Gap`)를 한 번의 순회로 동시 산출(평가 시간 50% 단축). |
 | **8.2** | `federated_core.py` | **`BaselineLoss` 재귀적 디바이스 동기화 (`_sync_criterion_device`)** | FLamby `BaselineLoss` 내부에 PyTorch 버퍼로 등록되지 않은 일반 텐서 속성(`self.alpha` 등)을 재귀적으로 탐색해 `CPU`/`CUDA` 디바이스로 이동시켜 런타임 디바이스 불일치 에러 원천 차단. |
 | **8.3** | `federated_core.py` | **`BatchNorm2d` 단일 샘플 배치 방어** | 미니배치 크기가 1일 때(`images.size(0) == 1`) `BatchNorm2d` 분산 계산 에러(`ValueError`)가 발생하지 않도록 건너뛰되, `num_updates` 스텝 카운트는 차감하지 않아 정확한 업데이트 횟수 보장. |
-| **8.4** | `main.py` | **`Centralized`의 Adam 모멘텀 유지 및 `weight_divergence = 0.0` 고정** | 연합학습은 라운드마다 로컬 옵티마이저를 새로 생성함(주의: FLamby 공식 FedAvg는 클라이언트 옵티마이저를 라운드 간 유지하므로 이 점은 공식 구현과 다름. 보고서에 "FLamby와 달리 라운드마다 Adam 상태를 초기화"라고 명시할 것). 상한 기준선인 상한 기준선인 `Centralized`는 루프 외부의 `central_optimizer`로 에폭 간 모멘텀을 유지함. 또한 `Centralized`의 `weight_divergence`는 `0.0`으로 고정해 Client Drift 그래프 왜곡 방지. |
+| **8.4** | `main.py` | **`Centralized`의 Adam 모멘텀 유지 및 `weight_divergence = 0.0` 고정** | 연합학습은 라운드마다 로컬 옵티마이저를 새로 생성함(주의: FLamby 공식 FedAvg는 클라이언트 옵티마이저를 라운드 간 유지하므로 이 점은 공식 구현과 다름. 보고서에 "FLamby와 달리 라운드마다 Adam 상태를 초기화"라고 명시할 것). 상한 기준선인 `Centralized`는 루프 외부의 `central_optimizer`로 에폭 간 모멘텀을 유지함. 또한 `Centralized`의 `weight_divergence`는 `0.0`으로 고정해 Client Drift 그래프 왜곡 방지. |
 | **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·옵티마이저·난수 상태와 클라이언트별 DataLoader 반복자 위치(에폭 내 소비 배치 수와 에폭 시작 시점 generator 상태)를 저장하며, 저장 도중 연결이 끊겨 파일이 깨지지 않도록 `.tmp` 작성 후 `os.replace`로 교체함. 재개 시 반복자 위치를 복원해 에폭 중간에서 끊긴 라운드도 이어가지만, GPU 비결정 연산 때문에 비트 단위 동일성까지는 보장하지 않음. 세션별 라이브러리·GPU·커밋 정보는 `*_env.json`에 누적 기록함. |
 | **8.6** | `fed_isic2019_colab.ipynb` | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
+
+
+---
+
+## 9. 변경 이력 (Changelog)
+
+### 2026-10-31 — 코드 리뷰 반영 (브랜치 `fix/notebook-source-resume-state`)
+
+| 번호 | 대상 파일 | 변경 내용 | 변경 이유 |
+| :---: | :--- | :--- | :--- |
+| **9.1** | `fed_isic2019_colab.ipynb` (셀 1-1, 1-2, Phase 0) | `REPO_URL`을 이 저장소(`NOWEAZ/fedisic-federated-framework`), `REPO_BRANCH`를 `main`으로 변경. FLamby를 커밋 `edacf54`로 고정(`git checkout`). 결과 저장 폴더를 `CDII_results_6client`로 분리. | 기존 셀이 옛 `Capstone-Design-II`의 3클라이언트 브랜치(`fix/validation-split-and-metrics`)를 clone해 `--num_updates`, `get_nb_max_rounds`가 없어 ImportError 또는 옛 설정으로 학습됨. FLamby HEAD 고정이 없으면 `BaselineLoss`의 alpha와 `get_nb_max_rounds`가 바뀔 때 결과를 재현할 수 없음. 3클라이언트 결과(`CDII_results`)와 섞이지 않게 분리. |
+| **9.2** | `federated_core.py` (`ClientStepIterator`) | `state_dict()` / `load_state_dict()` 추가. 현재 에폭 시작 시점의 DataLoader generator 상태와 소비한 배치 수를 저장하고, 재개 시 같은 순열을 다시 만든 뒤 소비한 배치만큼 건너뜀. | 라운드(100스텝)는 대부분 에폭 중간에서 끝나는데, 기존 `--resume`은 반복자 위치를 저장하지 않아 재개하면 다른 순열의 처음부터 시작해 끊기지 않은 실행과 배치 순서·증강 난수가 달라졌음. |
+| **9.3** | `main.py` (`last_*.pt`, resume) | 체크포인트에 `client_iterator_states` 저장, 재개 시 복원. 구버전 체크포인트에는 경고를 출력. | 9.2를 실제 재개 경로에 연결. |
+| **9.4** | `main.py` (`_run_final_test`) | 기존 `*_final_test.json`이 있을 때 저장된 `config`가 현재 `run_config`와 다르면 오류를 내고 중단. | 결과 파일명은 (method, mu, seed)만 반영하므로, 설정을 바꿔 다시 학습해도 이전 모델의 test 결과가 조용히 재사용될 수 있었음. |
+| **9.5** | `main.py` (`_collect_env_info`) | 실행·재개 세션마다 `{exp_tag}_seed{seed}_env.json`에 Python, torch, CUDA, GPU, 주요 라이브러리 버전, 프로젝트와 FLamby 커밋을 누적 기록. | 라이브러리 버전이 고정되어 있지 않아 나중에 결과를 재현·점검할 기록이 필요. 중간에 GPU나 환경이 바뀐 재개 실행도 식별할 수 있음. |
+| **9.6** | `tests/test_step_iterator_resume.py` (신규) | 합성 데이터(CPU)로 재개한 배치 순서가 끊기지 않은 실행과 같은지(워커 0개와 2개) 검증. 복원 없이 generator만 되돌리면 달라진다는 점도 함께 확인. | 9.2의 동작을 자동으로 검증. |
+| **9.7** | `PROJECT_OVERVIEW.md`, 본 문서 | 센터별 학습/검증 장수를 실제 분할 값으로 정정(예: Client 5 학습 313 / 검증 38). 8.4의 Adam 서술에 "FLamby 공식은 클라이언트 옵티마이저를 라운드 간 유지하므로 이 코드와 다름"을 명시. 8.5 서술을 "에폭 중간 위치까지 복원하는 재개"로 수정하고 비트 단위 동일성은 보장하지 않음을 명시. | 문서의 "약 N장" 수치가 실제 분할(클래스당 최소 1장 규칙)과 달랐고, "무손실 재개"와 "FLamby 공식과 동일" 표현이 구현과 맞지 않았음. |
+
+### 알려진 한계·미반영 항목
+- 클라이언트 Adam을 라운드마다 새로 만드는 동작은 유지함(FLamby 공식과 다름). 유지 옵션(`--keep_optimizer`)은 아직 구현하지 않음.
+- validation 없이 train 100%로 학습하는 모드(공식 학습량과 동일)는 아직 구현하지 않음.
+- `requirements.txt`의 torch, scikit-learn, pandas 등은 미고정. `*_env.json`에 기록된 버전을 확인해 고정할 예정.
+- 병원별(특히 Client 4, 5) 지표는 표본이 매우 작아 잡음이 큼. 부트스트랩 신뢰구간이나 큰 병원 기준 값 병기를 권장.
+- GPU 비결정 연산(예: AdaptiveAvgPool 역전파) 때문에 같은 시드라도 비트 단위로 같은 결과는 보장되지 않음.
