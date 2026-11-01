@@ -1,0 +1,1 @@
+{"best_mu": 0.1, "rule": "max val macro-F1 (last 3 rounds mean), tie -> smaller mu"}
