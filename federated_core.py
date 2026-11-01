@@ -157,6 +157,7 @@ def train_one_client(
     global_model: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     num_updates: int | None = None,
+    stats: dict | None = None,
 ) -> tuple[nn.Module, float]:
     """
     단일 클라이언트(또는 Centralized) 모델을 학습합니다.
@@ -177,6 +178,10 @@ def train_one_client(
         optimizer: 외부에서 유지하는 옵티마이저 (Centralized처럼 에폭 간 Adam 상태를 유지해야 할 때 전달).
                    None이면 호출 시마다 새 Adam을 생성 (연합학습 로컬 학습의 표준 방식)
         num_updates: 라운드당 로컬 업데이트(미니배치 스텝) 횟수. FLamby 공식 벤치마크는 100을 사용
+        stats: 빈 dict를 넘기면 학습 후 추가 통계를 채워 줌 (반환 시그니처는 그대로).
+               - "prox_loss": 스텝 평균 근접 항 기여분 (mu/2)*||w-w_global||^2 (mu==0이면 0.0)
+               - "prox_dist": 스텝 평균 ||w-w_global||_2 (mu==0이면 0.0)
+               - "steps": 실제로 수행한 스텝 수
 
     Returns:
         tuple: (학습된 local_model, 평균 train loss)
@@ -199,9 +204,12 @@ def train_one_client(
 
     total_base_loss = 0.0
     total_samples = 0
+    total_prox_loss = 0.0
+    total_prox_dist = 0.0
+    total_steps = 0
 
     def _run_batch(images, targets) -> bool:
-        nonlocal total_base_loss, total_samples
+        nonlocal total_base_loss, total_samples, total_prox_loss, total_prox_dist, total_steps
         # BatchNorm2d는 학습 시 미니배치 크기가 1이면 분산 계산 불가로 에러가 발생하므로 방어 처리
         if images.size(0) == 1:
             return False
@@ -219,9 +227,12 @@ def train_one_client(
             for local_p, global_p in zip(model.parameters(), global_params):
                 prox_term = prox_term + torch.sum((local_p - global_p) ** 2)
             loss = loss + (mu / 2.0) * prox_term
+            total_prox_loss += ((mu / 2.0) * prox_term).item()
+            total_prox_dist += float(prox_term.item() ** 0.5)
 
         loss.backward()
         optimizer.step()
+        total_steps += 1
 
         batch_size = images.size(0)
         total_base_loss += base_loss.item() * batch_size
@@ -249,13 +260,64 @@ def train_one_client(
                 _run_batch(images, targets)
 
     avg_loss = total_base_loss / max(total_samples, 1)
+    if stats is not None:
+        stats["prox_loss"] = total_prox_loss / max(total_steps, 1)
+        stats["prox_dist"] = total_prox_dist / max(total_steps, 1)
+        stats["steps"] = total_steps
     return model, avg_loss
+
+
+def optimizer_state_to_cpu(state):
+    """옵티마이저 state_dict의 텐서를 CPU로 복제합니다 (라운드 사이 보관·체크포인트 저장용)."""
+    if isinstance(state, torch.Tensor):
+        return state.detach().cpu().clone()
+    if isinstance(state, dict):
+        return {k: optimizer_state_to_cpu(v) for k, v in state.items()}
+    if isinstance(state, (list, tuple)):
+        return type(state)(optimizer_state_to_cpu(v) for v in state)
+    return state
+
+
+def get_bn_keys(model: nn.Module) -> list[str]:
+    """모델의 BatchNorm 층에 속한 state_dict 키(weight, bias, running_mean, running_var, num_batches_tracked) 목록."""
+    keys = []
+    for mod_name, module in model.named_modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            for k in module.state_dict().keys():
+                keys.append(f"{mod_name}.{k}" if mod_name else k)
+    return keys
+
+
+def extract_state(model: nn.Module, keys: list[str]) -> dict:
+    """state_dict에서 keys만 CPU로 복제해 꺼냅니다 (FedBN의 센터별 BN 상태 보관용)."""
+    sd = model.state_dict()
+    return {k: sd[k].detach().cpu().clone() for k in keys}
+
+
+def make_client_model_fn(global_model: nn.Module, client_states: list, scratch_model: nn.Module, device):
+    """
+    FedBN 평가용: 센터 idx에 대해 "글로벌 가중치 + 그 센터의 BN 상태"를 입힌 모델을 돌려주는 함수를 만듭니다.
+    scratch_model은 같은 구조의 작업용 모델 1개이며, 호출할 때마다 덮어써서 재사용합니다
+    (평가는 센터를 순서대로 처리하므로 안전). client_states[idx]가 None이면 글로벌 BN을 그대로 씁니다.
+    """
+
+    def fn(idx: int) -> nn.Module:
+        scratch_model.load_state_dict(global_model.state_dict())
+        st = client_states[idx]
+        if st is not None:
+            scratch_model.load_state_dict(st, strict=False)
+        scratch_model.to(device)
+        scratch_model.eval()
+        return scratch_model
+
+    return fn
 
 
 def server_aggregate(
     global_model: nn.Module,
     client_models: list[nn.Module],
     client_sample_counts: list[int],
+    skip_keys: list[str] | None = None,
 ) -> nn.Module:
     """
     클라이언트들의 샘플 수에 비례한 가중 평균으로 글로벌 모델 파라미터를 집계(Aggregation)합니다.
@@ -264,6 +326,7 @@ def server_aggregate(
         global_model: 업데이트할 글로벌 모델
         client_models: 학습 완료된 로컬 모델 리스트
         client_sample_counts: 각 클라이언트의 데이터 샘플 수 리스트
+        skip_keys: 집계에서 제외할 state_dict 키 (FedBN: BatchNorm 키). 제외된 키는 글로벌 값을 그대로 둠
 
     Returns:
         nn.Module: 파라미터가 업데이트된 글로벌 모델
@@ -276,11 +339,14 @@ def server_aggregate(
         raise ValueError("전체 클라이언트 샘플 수 합은 0보다 커야 합니다.")
 
     weights = [count / total_samples for count in client_sample_counts]
+    skip = set(skip_keys or [])
     global_state = copy.deepcopy(global_model.state_dict())
     client_states = [m.state_dict() for m in client_models]
 
     with torch.no_grad():
         for key in global_state.keys():
+            if key in skip:
+                continue
             target_tensor = global_state[key]
             # 실수형(float) 파라미터/버퍼는 가중 평균, 정수형 버퍼(num_batches_tracked 등)는 가중 평균 후 반올림
             if torch.is_floating_point(target_tensor):
@@ -399,6 +465,7 @@ def evaluate_model(
     n_bins: int = 15,
     num_classes: int = 8,
     return_predictions: bool = False,
+    client_model_fn=None,
 ) -> dict:
     """
     DataLoader(검증 또는 테스트)에서 모델을 평가하여
@@ -410,6 +477,9 @@ def evaluate_model(
       병원마다 보유 클래스가 다르므로 "없는 클래스 때문에 F1이 0으로 들어가는" 왜곡을 피합니다.
       max/min/gap/std도 이 값으로 계산합니다.
     - `macro_f1_fixed8` / `client_macro_f1_fixed8`: 클래스 0~(num_classes-1) 전부 평균 (보조 지표).
+
+    client_model_fn: None이 아니면 센터 idx마다 `client_model_fn(idx)`가 돌려주는 모델로 그 센터를 평가합니다
+        (FedBN처럼 센터별 모델이 다른 경우). 이때 Global 지표는 센터별 예측을 이어 붙여 계산합니다.
 
     Returns:
         dict: {
@@ -459,8 +529,9 @@ def evaluate_model(
         total_sample_cnt = 0
 
         for idx, c_loader in enumerate(client_eval_loaders):
+            eval_model = client_model_fn(idx) if client_model_fn is not None else model
             c_loss, c_prob, c_pred, c_true = _collect_predictions(
-                model, c_loader, device, criterion, desc=f"Eval Client {idx}"
+                eval_model, c_loader, device, criterion, desc=f"Eval Client {idx}"
             )
             client_f1s.append(_macro_f1(c_true, c_pred, np.unique(c_true)))
             client_f1s_fixed8.append(_macro_f1(c_true, c_pred, all_labels))
@@ -490,6 +561,8 @@ def evaluate_model(
         bal_acc_gap = float(max_bal_acc - min_bal_acc)
         bal_acc_std = float(np.std(client_bal_accs, ddof=1)) if len(client_bal_accs) > 1 else 0.0
     else:
+        if client_model_fn is not None:
+            raise ValueError("client_model_fn을 쓰려면 센터별 평가 로더(client_eval_loaders)가 필요합니다.")
         # 클라이언트별 로더가 없으면 클라이언트 간 공정성 지표를 정의할 수 없으므로 NaN으로 기록
         avg_loss, y_prob, y_pred, y_true = _collect_predictions(
             model, dataloader, device, criterion, desc="Evaluating Global"

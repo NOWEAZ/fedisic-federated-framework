@@ -26,6 +26,10 @@ from federated_core import (
     compute_round_comm_mb,
     compute_weight_divergence,
     evaluate_model,
+    extract_state,
+    get_bn_keys,
+    make_client_model_fn,
+    optimizer_state_to_cpu,
     server_aggregate,
     train_one_client,
 )
@@ -55,6 +59,8 @@ CSV_FIELDS = [
     *[f"balanced_acc_client{k}" for k in range(NUM_CLIENTS)],
     *[f"macro_f1_client{k}" for k in range(NUM_CLIENTS)],
     *[f"macro_f1_fixed8_client{k}" for k in range(NUM_CLIENTS)],
+    "prox_loss",
+    "prox_dist",
     "weight_divergence",
     "cumulative_comm_mb",
 ]
@@ -70,7 +76,10 @@ RESUME_CONFIG_KEYS = [
     "batch_size",
     "val_fraction",
     "split_seed",
+    "keep_optimizer",
 ]
+# 새로 추가된 설정 키가 없는 구버전 체크포인트를 읽을 때 쓰는 기본값
+RESUME_CONFIG_DEFAULTS = {"keep_optimizer": False}
 
 
 def _collect_env_info() -> dict:
@@ -135,8 +144,11 @@ def parse_args():
         "--method",
         type=str,
         default="fedavg",
-        choices=["centralized", "fedavg", "fedprox"],
-        help="학습 방식 선택: centralized, fedavg, fedprox",
+        choices=["centralized", "fedavg", "fedprox", "fedbn"],
+        help=(
+            "학습 방식 선택: centralized, fedavg, fedprox, fedbn "
+            "(fedbn = FedAvg + BatchNorm 층(가중치·통계)은 집계하지 않고 센터별로 유지)"
+        ),
     )
     parser.add_argument(
         "--rounds",
@@ -228,6 +240,18 @@ def parse_args():
         help="학습 종료 후 마지막 라운드 모델(과 best-val 모델)을 FLamby test로 딱 1회 평가해 "
              "*_final_test.json / *_final_test_preds.npz로 저장 (이미 결과 파일이 있으면 다시 열지 않음)",
     )
+    parser.add_argument(
+        "--keep_optimizer",
+        action="store_true",
+        help="연합학습에서 각 클라이언트의 Adam 상태(모멘텀)를 라운드 사이에 유지 (FLamby 공식 방식). "
+             "지정하지 않으면 라운드마다 새 Adam을 만드는 기존 동작. centralized는 항상 유지하므로 무시됨",
+    )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="결과 파일 이름 뒤에 붙일 꼬리표 (예: 확장 라운드 실험을 기준선과 구분). 공백 없이",
+    )
     return parser.parse_args()
 
 
@@ -303,12 +327,15 @@ def _run_final_test(
     test_loader,
     criterion,
     device,
+    scratch_model=None,
+    client_bn_states=None,
 ):
     """
     학습이 모두 끝난 뒤 FLamby test를 딱 1회 평가합니다.
 
     - 마지막 라운드 모델(주 결과)과 best-val 모델(참고)을 평가합니다. 둘 다 test가 아니라 val로 정해진 모델입니다.
     - 결과 파일이 이미 있으면 test를 다시 열지 않고 건너뜁니다 (여러 번 보고 고르는 것을 방지).
+    - FedBN(scratch_model, client_bn_states 지정)은 센터마다 "글로벌 가중치 + 그 센터의 BN"으로 평가합니다.
     - 마지막 모델의 예측(y_true, y_pred, y_prob, client_idx)을 .npz로 저장해 bootstrap 신뢰구간 등을
       학습 재실행 없이 계산할 수 있게 합니다.
     """
@@ -337,6 +364,11 @@ def _run_final_test(
         device=device,
         criterion=criterion,
         return_predictions=True,
+        client_model_fn=(
+            make_client_model_fn(global_model, client_bn_states, scratch_model, device)
+            if scratch_model is not None
+            else None
+        ),
     )
     preds = final_metrics["predictions"]
     np.savez_compressed(
@@ -367,6 +399,11 @@ def _run_final_test(
             dataloader=test_loader,
             device=device,
             criterion=criterion,
+            client_model_fn=(
+                make_client_model_fn(best_model, best_ckpt.get("client_bn_states"), scratch_model, device)
+                if scratch_model is not None and best_ckpt.get("client_bn_states") is not None
+                else None
+            ),
         )
         result["best_val"] = {
             "round": best_ckpt.get("round"),
@@ -403,6 +440,14 @@ def main():
                 args.rounds = NUM_EPOCHS_POOLED
 
     effective_mu = args.mu if args.method == "fedprox" else 0.0
+    is_federated = args.method != "centralized"
+    use_fedbn = args.method == "fedbn"
+    # centralized는 항상 옵티마이저를 유지하므로 --keep_optimizer는 연합학습에서만 의미가 있다
+    keep_optimizer = bool(args.keep_optimizer) and is_federated
+    if args.keep_optimizer and not is_federated:
+        print("[Info] --keep_optimizer는 centralized에서는 무시됩니다 (이미 Adam 상태를 유지).")
+    if args.tag and not all(c.isalnum() or c in "-_." for c in args.tag):
+        raise ValueError("--tag에는 영문자·숫자·-_. 만 쓸 수 있습니다.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] Using device: {device} | Seed: {args.seed}")
     schedule_desc = (
@@ -412,7 +457,8 @@ def main():
     )
     print(
         f"[Info] Method: {args.method} | Clients: {NUM_CLIENTS} | Rounds: {args.rounds} | "
-        f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} | Mu: {effective_mu}"
+        f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} | Mu: {effective_mu} | "
+        f"KeepOptimizer: {keep_optimizer}"
     )
 
     # 1. DataLoader 준비 (FLamby 공식 6개 센터: Center 0 ~ 5)
@@ -470,6 +516,11 @@ def main():
         exp_tag = f"{args.method}_mu{effective_mu:g}"
     else:
         exp_tag = f"{args.method}"
+    # 설정이 다른 실험이 같은 파일 이름을 쓰지 않도록 꼬리표를 붙인다
+    if keep_optimizer:
+        exp_tag += "_keepopt"
+    if args.tag:
+        exp_tag += f"_{args.tag}"
 
     csv_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_metrics.csv")
     best_model_path = os.path.join(args.save_dir, f"best_{exp_tag}_seed{args.seed}.pt")
@@ -486,6 +537,7 @@ def main():
         "batch_size": args.batch_size,
         "val_fraction": args.val_fraction,
         "split_seed": args.split_seed,
+        "keep_optimizer": keep_optimizer,
     }
 
     env_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_env.json")
@@ -500,6 +552,13 @@ def main():
     start_round = 1
     best_balanced_acc = -1.0
 
+    # 연합학습 보조 상태 (체크포인트에도 저장): 클라이언트별 Adam 상태, FedBN의 센터별 BN 상태
+    client_opt_states = [None] * num_clients
+    bn_keys = get_bn_keys(global_model) if use_fedbn else []
+    client_bn_states = [None] * num_clients
+    # FedBN 평가용 작업 모델 (센터마다 글로벌 가중치 + 그 센터 BN을 덮어써서 재사용)
+    scratch_model = copy.deepcopy(global_model) if use_fedbn else None
+
     # 5. Resume: 동일 실험의 last 체크포인트가 있으면 이어서 학습
     if args.resume and os.path.exists(last_ckpt_path):
         try:
@@ -508,12 +567,17 @@ def main():
             ckpt = torch.load(last_ckpt_path, map_location="cpu")
         saved_config = ckpt.get("config", {})
         mismatched = [
-            k for k in RESUME_CONFIG_KEYS if saved_config.get(k) != run_config[k]
+            k
+            for k in RESUME_CONFIG_KEYS
+            if saved_config.get(k, RESUME_CONFIG_DEFAULTS.get(k)) != run_config[k]
         ]
         if mismatched:
             raise ValueError(
                 f"[Resume] 체크포인트 설정과 현재 인자가 다릅니다: "
-                + ", ".join(f"{k} (ckpt={saved_config.get(k)}, now={run_config[k]})" for k in mismatched)
+                + ", ".join(
+                    f"{k} (ckpt={saved_config.get(k, RESUME_CONFIG_DEFAULTS.get(k))}, now={run_config[k]})"
+                    for k in mismatched
+                )
             )
 
         global_model.load_state_dict(ckpt["model_state_dict"])
@@ -521,6 +585,16 @@ def main():
         if central_optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
             central_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         best_balanced_acc = ckpt["best_balanced_acc"]
+        if keep_optimizer:
+            saved_opt = ckpt.get("client_optimizer_states")
+            if saved_opt is None:
+                raise ValueError("[Resume] --keep_optimizer 체크포인트에 클라이언트 옵티마이저 상태가 없습니다.")
+            client_opt_states = saved_opt
+        if use_fedbn:
+            saved_bn = ckpt.get("client_bn_states")
+            if saved_bn is None:
+                raise ValueError("[Resume] fedbn 체크포인트에 센터별 BN 상태가 없습니다.")
+            client_bn_states = saved_bn
         start_round = ckpt["round"] + 1
         _restore_rng_states(ckpt["rng_states"], client_loaders, centralized_loader)
         iterator_states = ckpt.get("client_iterator_states")
@@ -563,13 +637,26 @@ def main():
             )
             # Centralized는 단일 글로벌 모델만 존재하므로 클라이언트 간 가중치 발산(Client Drift)은 0.0
             avg_divergence = 0.0
+            avg_prox_loss = 0.0
+            avg_prox_dist = 0.0
         else:
             local_models = []
             local_losses = []
             divergences = []
+            prox_losses = []
+            prox_dists = []
 
-            for step_iter in client_step_iterators:
+            for ci, step_iter in enumerate(client_step_iterators):
                 local_model = copy.deepcopy(global_model)
+                if use_fedbn and client_bn_states[ci] is not None:
+                    # FedBN: 서버 모델을 받되 BN 층은 이 센터가 지난 라운드에 쓰던 값으로 되돌린다
+                    local_model.load_state_dict(client_bn_states[ci], strict=False)
+                local_optimizer = None
+                if keep_optimizer:
+                    local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
+                    if client_opt_states[ci] is not None:
+                        local_optimizer.load_state_dict(client_opt_states[ci])
+                train_stats = {}
                 trained_local_model, c_loss = train_one_client(
                     model=local_model,
                     dataloader=step_iter,
@@ -579,13 +666,21 @@ def main():
                     device=device,
                     mu=effective_mu,
                     global_model=global_model,
+                    optimizer=local_optimizer,
                     num_updates=effective_num_updates,
+                    stats=train_stats,
                 )
+                if keep_optimizer:
+                    client_opt_states[ci] = optimizer_state_to_cpu(local_optimizer.state_dict())
+                if use_fedbn:
+                    client_bn_states[ci] = extract_state(trained_local_model, bn_keys)
 
                 div = compute_weight_divergence(global_model, trained_local_model)
                 local_models.append(trained_local_model)
                 local_losses.append(c_loss)
                 divergences.append(div)
+                prox_losses.append(train_stats.get("prox_loss", 0.0))
+                prox_dists.append(train_stats.get("prox_dist", 0.0))
 
             # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(BaselineLoss 기준) 계산
             total_samples = sum(client_sample_counts)
@@ -593,11 +688,18 @@ def main():
                 l * n for l, n in zip(local_losses, client_sample_counts)
             ) / max(total_samples, 1)
             avg_divergence = sum(divergences) / max(len(divergences), 1)
+            avg_prox_loss = sum(
+                l * n for l, n in zip(prox_losses, client_sample_counts)
+            ) / max(total_samples, 1)
+            avg_prox_dist = sum(
+                l * n for l, n in zip(prox_dists, client_sample_counts)
+            ) / max(total_samples, 1)
 
             global_model = server_aggregate(
                 global_model=global_model,
                 client_models=local_models,
                 client_sample_counts=client_sample_counts,
+                skip_keys=bn_keys if use_fedbn else None,
             )
 
         # 글로벌 검증셋 및 클라이언트별 검증셋 평가 (test는 학습 종료 후 --final_test로 1회만 평가)
@@ -606,6 +708,11 @@ def main():
             dataloader=val_loader,
             device=device,
             criterion=criterion,
+            client_model_fn=(
+                make_client_model_fn(global_model, client_bn_states, scratch_model, device)
+                if use_fedbn
+                else None
+            ),
         )
         val_loss = eval_metrics["loss"]
         balanced_acc = eval_metrics["balanced_acc"]
@@ -630,7 +737,7 @@ def main():
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Bal Acc: {balanced_acc:.4f} (Std: {bal_acc_std:.4f}, Gap: {bal_acc_gap:.4f}) | "
             f"Macro F1: {macro_f1:.4f} (Std: {macro_f1_std:.4f}, Gap: {macro_f1_gap:.4f}) | "
-            f"ECE: {ece:.4f} | Weight Div: {avg_divergence:.4f} | "
+            f"ECE: {ece:.4f} | Weight Div: {avg_divergence:.4f} | Prox: {avg_prox_loss:.5f} | "
             f"Comm: {cumulative_comm_mb:.1f} MB"
         )
 
@@ -655,6 +762,8 @@ def main():
             "min_bal_acc": round(min_bal_acc, 6),
             "bal_acc_gap": round(bal_acc_gap, 6),
             "bal_acc_std": round(bal_acc_std, 6),
+            "prox_loss": round(avg_prox_loss, 8),
+            "prox_dist": round(avg_prox_dist, 6),
             "weight_divergence": round(avg_divergence, 6),
             "cumulative_comm_mb": round(cumulative_comm_mb, 2),
         }
@@ -688,6 +797,8 @@ def main():
                     "bal_acc_std": bal_acc_std,
                     "cumulative_comm_mb": cumulative_comm_mb,
                     "model_state_dict": global_model.state_dict(),
+                    # FedBN: 센터별 BN 상태도 있어야 이 best 모델을 그대로 재평가할 수 있다
+                    "client_bn_states": copy.deepcopy(client_bn_states) if use_fedbn else None,
                 },
                 best_model_path,
             )
@@ -708,6 +819,8 @@ def main():
                 "rng_states": _capture_rng_states(client_loaders, centralized_loader),
                 # 에폭 중간에서 끝난 라운드를 정확히 이어가기 위한 클라이언트 반복자 위치
                 "client_iterator_states": [it.state_dict() for it in client_step_iterators],
+                "client_optimizer_states": client_opt_states if keep_optimizer else None,
+                "client_bn_states": client_bn_states if use_fedbn else None,
             },
             last_ckpt_path,
         )
@@ -726,6 +839,8 @@ def main():
             test_loader=test_loader,
             criterion=criterion,
             device=device,
+            scratch_model=scratch_model,
+            client_bn_states=client_bn_states if use_fedbn else None,
         )
 
 

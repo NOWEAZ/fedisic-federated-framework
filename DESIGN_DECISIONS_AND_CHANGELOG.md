@@ -166,8 +166,23 @@
 | **9.7** | `PROJECT_OVERVIEW.md`, 본 문서 | 센터별 학습/검증 장수를 실제 분할 값으로 정정(예: Client 5 학습 313 / 검증 38). 8.4의 Adam 서술에 "FLamby 공식은 클라이언트 옵티마이저를 라운드 간 유지하므로 이 코드와 다름"을 명시. 8.5 서술을 "에폭 중간 위치까지 복원하는 재개"로 수정하고 비트 단위 동일성은 보장하지 않음을 명시. | 문서의 "약 N장" 수치가 실제 분할(클래스당 최소 1장 규칙)과 달랐고, "무손실 재개"와 "FLamby 공식과 동일" 표현이 구현과 맞지 않았음. |
 
 ### 알려진 한계·미반영 항목
-- 클라이언트 Adam을 라운드마다 새로 만드는 동작은 유지함(FLamby 공식과 다름). 유지 옵션(`--keep_optimizer`)은 아직 구현하지 않음.
+- 클라이언트 Adam을 라운드마다 새로 만드는 동작이 기본값으로 남아 있음(FLamby 공식과 다름). 유지 옵션은 아래 10.1에서 `--keep_optimizer`로 구현함(기본값은 기존 동작 유지, 지금까지의 결과는 모두 기본값으로 얻음).
 - validation 없이 train 100%로 학습하는 모드(공식 학습량과 동일)는 아직 구현하지 않음.
 - `requirements.txt`의 torch, scikit-learn, pandas 등은 미고정. `*_env.json`에 기록된 버전을 확인해 고정할 예정.
 - 병원별(특히 Client 4, 5) 지표는 표본이 매우 작아 잡음이 큼. 부트스트랩 신뢰구간이나 큰 병원 기준 값 병기를 권장.
 - GPU 비결정 연산(예: AdaptiveAvgPool 역전파) 때문에 같은 시드라도 비트 단위로 같은 결과는 보장되지 않음.
+
+### 2026-11-01 — 6센터 Kaggle 결과 분석에 따른 확장 (브랜치 `feature/v2-keepopt-fedbn-analysis`)
+
+근거: `results/fed_isic_6client_kaggle_1101/`의 분석(연합은 9라운드에서 아직 수렴하지 않았고 학습 손실이 중앙집중보다 높음, 연합은 NV로 쏠려 MEL·BCC·AK·SCC recall이 낮음, 센터 4가 무너지고 병원 간 격차가 중앙집중의 약 2배). 아래 변경은 **기본 동작을 바꾸지 않는 추가 기능**이며, 효과는 아직 실행해 확인하지 않은 가설이다.
+
+| 번호 | 대상 파일 | 변경 내용 | 변경 이유 |
+| :---: | :--- | :--- | :--- |
+| **10.1** | `main.py`, `federated_core.py` | `--keep_optimizer` 추가. 클라이언트마다 Adam `state_dict`를 CPU에 보관하고 다음 라운드에서 새 로컬 모델의 Adam에 불러와 이어서 사용. 체크포인트(`last_*.pt`)에 저장되어 `--resume`으로 복원. 결과 파일 이름 뒤에 `_keepopt`가 붙고 `run_config`·`RESUME_CONFIG_KEYS`에 포함(구버전 체크포인트는 `False`로 간주). | FLamby는 클라이언트 옵티마이저를 라운드 사이 유지하는데 이 코드는 매번 새로 만들어 공식과 달랐음(8.4). 라운드당 100스텝뿐이라 영향이 있을 수 있어 옵션으로 비교. |
+| **10.2** | `federated_core.py`, `main.py` | `train_one_client(..., stats=dict)`로 FedProx 근접 항 기여분(`prox_loss`)과 거리(`prox_dist`)를 스텝 평균으로 돌려받아 `*_metrics.csv`에 `prox_loss`, `prox_dist` 열로 기록(샘플 수 가중 평균, FedAvg는 0). | μ가 실제로 학습에 작용하는지 이전에는 확인할 수 없었음(기존 리뷰의 지적). |
+| **10.3** | `federated_core.py`, `main.py` | `--method fedbn` 추가. 집계(`server_aggregate(skip_keys=...)`)에서 BatchNorm의 weight/bias/running 통계/`num_batches_tracked`를 제외하고, 각 센터는 자기 BN 상태를 보관해 다음 라운드에 서버 가중치 위에 다시 입힘. 평가는 `evaluate_model(client_model_fn=...)`로 센터마다 "글로벌 가중치 + 그 센터의 BN"으로 수행(Global 지표는 센터별 예측을 이어 붙여 계산). best/last 체크포인트에 센터별 BN 상태 저장. | 병원마다 촬영 조건이 달라 BN 통계가 다름. 현재 FedAvg는 BN 버퍼까지 평균냄. **주의: 평가 방식이 "서버 모델 하나"가 아니라 "센터별 개인화 모델"이므로 FedAvg/FedProx와 같은 표에 넣을 때 이 차이를 명시할 것.** |
+| **10.4** | `main.py` | `--tag` 추가(결과 파일 이름 꼬리표). 확장 라운드(`--rounds 18 --tag r18`) 결과가 공식 9라운드 결과를 덮어쓰거나 `--final_test` 설정 검사에 걸리지 않도록 구분. | 공식 9라운드는 기준선으로 유지하고 확장 설정은 별도 결과로 보관. |
+| **10.5** | `analysis/analyze_extended.py` (신규) | `*_final_test_preds.npz`만으로 클래스별 recall·precision·예측 비율, 혼동행렬(시드 평균, 행 정규화), 센터 안 복원추출 부트스트랩 95% 신뢰구간(전체·센터별), 같은 시드끼리 짝지은 방법 간 차이(시드별 부호·평균·부트스트랩 구간)를 CSV로 출력. 모든 방법·시드에 같은 재추출 인덱스를 적용하므로 차이의 구간이 paired 비교가 됨. | 센터 4·5 test가 164·88장이라 점추정만으로는 잡음이 큼. 3개 시드의 우열을 부호로 함께 확인해야 함. 신뢰구간은 test 표본 변동만 반영하며 시드 간 변동은 `paired_by_seed.csv`로 따로 봄. |
+| **10.6** | `tests/test_main_smoke.py`, `tests/test_analysis.py` (신규) | 가짜 데이터·작은 모델(CPU)로 `main.py`를 끝까지 실행해 `--keep_optimizer`의 Adam 스텝 누적과 resume, FedBN의 BN 비집계·센터별 평가·final_test·resume, `prox_loss` 기록, `--tag` 파일명을 검증. 분석 지표를 sklearn과 대조. | 실제 GPU 학습 전에 새 경로의 논리 오류를 걸러냄. (EfficientNet·FLamby 데이터로는 아직 실행해 보지 않음) |
+
+시드 5개로 확대: 기존 `42, 100, 2026`에 `7, 1234`를 추가(탐색 시드 `41`, μ 재확인 시드 `40`과 겹치지 않음). 실험 순서·비용·명령은 `EXPERIMENT_PLAN_V2.md` 참고.
