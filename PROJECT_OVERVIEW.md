@@ -92,6 +92,7 @@ FLamby의 `FedIsic2019`는 실제 의료기관 및 더모스코피 장비 출처
 | **`bal_acc_gap`** | 6개 클라이언트 간 최고-최저 `Balanced Accuracy` 격차 ($\max_k \text{BalAcc}_k - \min_k \text{BalAcc}_k$) | $\downarrow$ |
 | **`balanced_acc_client0~5`** | 6개 클라이언트(병원 0~5)별 개별 `Balanced Accuracy` | $\uparrow$ |
 | **`macro_f1_client0~5`** / `macro_f1_fixed8_client0~5` | 6개 클라이언트(병원 0~5)별 개별 `Macro-F1` (존재 클래스 기준 / 8클래스 고정) | $\uparrow$ |
+| `lr` | 해당 라운드에서 쓴 학습률 (`--lr_schedule`이 `constant`면 항상 `--lr`) | - |
 | **`prox_loss`** / `prox_dist` | FedProx 근접 항의 스텝 평균 기여분 $\frac{\mu}{2}\|w-w_{\text{global}}\|^2$ 과 평균 거리 $\|w-w_{\text{global}}\|_2$ (샘플 수 가중 평균). FedAvg·FedBN·Centralized는 `0` | 분석용 |
 | **`weight_divergence`** | 글로벌 모델과 6개 로컬 모델 파라미터 간 평균 L2 거리 ($\|w_{\text{local}} - w_{\text{global}}\|_2$, **Client Drift 지표**) | 분석용 |
 | **`cumulative_comm_mb`** | 해당 라운드까지의 누적 양방향 통신량(MB). (`r × 2 × 6 × model_size_mb`, Centralized는 `0`) | $\downarrow$ |
@@ -119,6 +120,9 @@ FLamby의 `FedIsic2019`는 실제 의료기관 및 더모스코피 장비 출처
 | `--split_seed` | `0` | train/val 분할 시드 (실험 시드와 무관하게 고정) |
 | `--final_test` | `False` (플래그) | 학습 종료 후 마지막 라운드 모델(과 best-val 모델)을 Test 셋으로 **단 1회** 평가해 저장 |
 | `--keep_optimizer` | `False` (플래그) | 연합학습에서 각 클라이언트의 Adam 상태를 라운드 사이에 유지 (FLamby 공식 방식). 결과 파일 이름에 `_keepopt`가 붙음. `centralized`에서는 무시 |
+| `--lr_schedule` | `constant` | 라운드(Centralized는 에폭)별 학습률. `constant`=FLamby 공식(기본), `cosine`=lr→lr×`--lr_min_factor`(기본 0.1) 코사인 감소, `step`=전체의 2/3 이후 절반. 후반 정체(과소적합) 대응용 확장 설정, 결과 파일 이름에 `_cosine`/`_step` |
+| `--server_momentum` / `--server_lr` | `0.0` / `1.0` | FedAvgM 서버 모멘텀(연합학습만). 평균 모델과 직전 글로벌의 차이를 모멘텀으로 누적. 결과 파일 이름에 `_svm<β>` |
+| `--weight_decay` | `0.0` | 0보다 크면 Adam 대신 AdamW(분리형 가중치 감쇠). 과적합 완화용 확장 설정, `_wd<값>` |
 | `--tag` | `""` | 결과 파일 이름 뒤에 붙일 꼬리표 (예: 확장 라운드 `r18`). 설정이 다른 실험이 같은 파일을 덮어쓰지 않게 구분하는 용도 |
 
 ### 6.2 CLI 실행 예시

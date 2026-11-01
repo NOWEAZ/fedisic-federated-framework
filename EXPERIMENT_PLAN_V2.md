@@ -17,7 +17,8 @@
 | E2 | `--keep_optimizer` fedavg·fedprox, 5시드 | 10회 | 약 5.2h | FLamby 공식과 같은 Adam 유지의 영향 |
 | E3 | FedBN, 5시드 (9라운드) | 5회 | 약 2.6h | 센터별 BN이 센터 4 같은 소규모 센터에 도움이 되는지 |
 | E4 | 확장 18라운드 fedavg·fedprox, 3시드 (`--rounds 18 --tag r18`) | 6회 | 약 6.2h | 9라운드에서 미수렴이었던 것이 더 돌리면 개선되는지 |
-| | 합계 | 33회 | 약 20.2h | |
+| E5 | 과소적합·과적합 대응 조합 (선택): 18라운드 + `--lr_schedule cosine` (+선택 `--server_momentum 0.5`) fedavg·fedprox, 3시드 / Centralized `--weight_decay 0.01` 3시드 | 12회 | 약 8.5h | 학습량 증가만으로 부족할 때 후반 정체·서버 평균 속도를 개선하는지 / Centralized 약한 과적합 완화 |
+| | 합계 (E5 제외) | 33회 | 약 20.2h | |
 
 E1을 먼저 하면 E2~E4에 쓸 μ를 확정할 수 있습니다. 쿼터가 부족하면 E1 → E3 → E0 → E2 → E4 순으로 줄이는 것을 권장합니다.
 
@@ -30,6 +31,11 @@ python main.py --method fedprox --mu 0.3  --seed 41 --data_path $DATA --save_dir
 python main.py --method fedprox --mu $BEST_MU --keep_optimizer --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
 # E3: FedBN
 python main.py --method fedbn --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
+# E5: 과소적합 대응 (확장 라운드 + 학습률 감소 [+ 서버 모멘텀])
+python main.py --method fedprox --mu $BEST_MU --rounds 18 --lr_schedule cosine --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
+python main.py --method fedavg --rounds 18 --lr_schedule cosine --server_momentum 0.5 --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
+# 과적합 대응 (Centralized): 가중치 감쇠
+python main.py --method centralized --weight_decay 0.01 --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
 # E4: 확장 라운드
 python main.py --method fedavg --rounds 18 --tag r18 --seed 42 --data_path $DATA --save_dir ./results_v2 --resume --final_test
 ```

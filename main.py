@@ -27,7 +27,10 @@ from federated_core import (
     compute_weight_divergence,
     evaluate_model,
     extract_state,
+    apply_server_momentum,
+    build_optimizer,
     get_bn_keys,
+    lr_for_round,
     make_client_model_fn,
     optimizer_state_to_cpu,
     server_aggregate,
@@ -42,6 +45,7 @@ CSV_FIELDS = [
     "mu",
     "seed",
     "eval_split",
+    "lr",
     "train_loss",
     "val_loss",
     "balanced_acc",
@@ -77,9 +81,21 @@ RESUME_CONFIG_KEYS = [
     "val_fraction",
     "split_seed",
     "keep_optimizer",
+    "lr_schedule",
+    "lr_min_factor",
+    "server_momentum",
+    "server_lr",
+    "weight_decay",
 ]
 # 새로 추가된 설정 키가 없는 구버전 체크포인트를 읽을 때 쓰는 기본값
-RESUME_CONFIG_DEFAULTS = {"keep_optimizer": False}
+RESUME_CONFIG_DEFAULTS = {
+    "keep_optimizer": False,
+    "lr_schedule": "constant",
+    "lr_min_factor": 0.1,
+    "server_momentum": 0.0,
+    "server_lr": 1.0,
+    "weight_decay": 0.0,
+}
 
 
 def _collect_env_info() -> dict:
@@ -245,6 +261,38 @@ def parse_args():
         action="store_true",
         help="연합학습에서 각 클라이언트의 Adam 상태(모멘텀)를 라운드 사이에 유지 (FLamby 공식 방식). "
              "지정하지 않으면 라운드마다 새 Adam을 만드는 기존 동작. centralized는 항상 유지하므로 무시됨",
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "cosine", "step"],
+        help="라운드(centralized는 에폭)별 학습률 스케줄. constant=FLamby 공식(기본). cosine=base lr에서 base lr*lr_min_factor까지 "
+             "코사인 감소, step=전체의 2/3 지점 이후 base lr의 절반. 후반 정체(과소적합) 대응용 확장 설정",
+    )
+    parser.add_argument(
+        "--lr_min_factor",
+        type=float,
+        default=0.1,
+        help="cosine 스케줄의 마지막 라운드 학습률 비율 (기본 0.1)",
+    )
+    parser.add_argument(
+        "--server_momentum",
+        type=float,
+        default=0.0,
+        help="FedAvgM 서버 모멘텀 계수 beta (0이면 일반 FedAvg 집계). 연합학습(fedavg/fedprox/fedbn)에서만 적용되는 확장 설정",
+    )
+    parser.add_argument(
+        "--server_lr",
+        type=float,
+        default=1.0,
+        help="서버 모멘텀 사용 시 서버 학습률 (기본 1.0). --server_momentum이 0이고 1.0이면 사용하지 않음",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="0보다 크면 Adam 대신 AdamW(분리형 가중치 감쇠)를 사용. 과적합 완화용 확장 설정 (기본 0=FLamby 공식 Adam)",
     )
     parser.add_argument(
         "--tag",
@@ -446,6 +494,11 @@ def main():
     keep_optimizer = bool(args.keep_optimizer) and is_federated
     if args.keep_optimizer and not is_federated:
         print("[Info] --keep_optimizer는 centralized에서는 무시됩니다 (이미 Adam 상태를 유지).")
+    use_server_opt = is_federated and (args.server_momentum > 0.0 or args.server_lr != 1.0)
+    if (args.server_momentum > 0.0 or args.server_lr != 1.0) and not is_federated:
+        print("[Info] --server_momentum/--server_lr은 centralized에서는 무시됩니다.")
+    if args.server_momentum < 0.0 or args.server_momentum >= 1.0:
+        raise ValueError("--server_momentum은 0 이상 1 미만이어야 합니다.")
     if args.tag and not all(c.isalnum() or c in "-_." for c in args.tag):
         raise ValueError("--tag에는 영문자·숫자·-_. 만 쓸 수 있습니다.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -458,7 +511,8 @@ def main():
     print(
         f"[Info] Method: {args.method} | Clients: {NUM_CLIENTS} | Rounds: {args.rounds} | "
         f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} | Mu: {effective_mu} | "
-        f"KeepOptimizer: {keep_optimizer}"
+        f"KeepOptimizer: {keep_optimizer} | LR schedule: {args.lr_schedule} | "
+        f"Server momentum/lr: {args.server_momentum}/{args.server_lr} | Weight decay: {args.weight_decay}"
     )
 
     # 1. DataLoader 준비 (FLamby 공식 6개 센터: Center 0 ~ 5)
@@ -506,7 +560,7 @@ def main():
     # Centralized는 에폭 간 Adam 모멘텀을 유지해야 하므로 옵티마이저를 루프 밖에서 1회만 생성
     # (연합학습은 라운드마다 클라이언트 로컬 옵티마이저를 새로 생성하는 표준 방식을 따름)
     central_optimizer = (
-        torch.optim.Adam(global_model.parameters(), lr=args.lr)
+        build_optimizer(global_model.parameters(), args.lr, args.weight_decay)
         if args.method == "centralized"
         else None
     )
@@ -519,6 +573,12 @@ def main():
     # 설정이 다른 실험이 같은 파일 이름을 쓰지 않도록 꼬리표를 붙인다
     if keep_optimizer:
         exp_tag += "_keepopt"
+    if args.lr_schedule != "constant":
+        exp_tag += f"_{args.lr_schedule}"
+    if use_server_opt:
+        exp_tag += f"_svm{args.server_momentum:g}" + (f"lr{args.server_lr:g}" if args.server_lr != 1.0 else "")
+    if args.weight_decay > 0.0:
+        exp_tag += f"_wd{args.weight_decay:g}"
     if args.tag:
         exp_tag += f"_{args.tag}"
 
@@ -538,6 +598,11 @@ def main():
         "val_fraction": args.val_fraction,
         "split_seed": args.split_seed,
         "keep_optimizer": keep_optimizer,
+        "lr_schedule": args.lr_schedule,
+        "lr_min_factor": args.lr_min_factor,
+        "server_momentum": args.server_momentum if use_server_opt else 0.0,
+        "server_lr": args.server_lr if use_server_opt else 1.0,
+        "weight_decay": args.weight_decay,
     }
 
     env_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_env.json")
@@ -556,6 +621,7 @@ def main():
     client_opt_states = [None] * num_clients
     bn_keys = get_bn_keys(global_model) if use_fedbn else []
     client_bn_states = [None] * num_clients
+    server_velocity: dict = {}   # FedAvgM 모멘텀 (파라미터 이름 -> CPU 텐서)
     # FedBN 평가용 작업 모델 (센터마다 글로벌 가중치 + 그 센터 BN을 덮어써서 재사용)
     scratch_model = copy.deepcopy(global_model) if use_fedbn else None
 
@@ -590,6 +656,11 @@ def main():
             if saved_opt is None:
                 raise ValueError("[Resume] --keep_optimizer 체크포인트에 클라이언트 옵티마이저 상태가 없습니다.")
             client_opt_states = saved_opt
+        if use_server_opt:
+            saved_vel = ckpt.get("server_velocity")
+            if saved_vel is None:
+                raise ValueError("[Resume] 서버 모멘텀 체크포인트에 server_velocity가 없습니다.")
+            server_velocity = saved_vel
         if use_fedbn:
             saved_bn = ckpt.get("client_bn_states")
             if saved_bn is None:
@@ -622,12 +693,14 @@ def main():
 
     # 6. 라운드별 학습 및 평가 루프
     for r in range(start_round, args.rounds + 1):
+        round_lr = lr_for_round(args.lr, args.lr_schedule, r, args.rounds, args.lr_min_factor)
         if args.method == "centralized":
             global_model, train_loss = train_one_client(
                 model=global_model,
                 dataloader=centralized_loader,
                 criterion=criterion,
-                lr=args.lr,
+                lr=round_lr,
+                weight_decay=args.weight_decay,
                 local_epochs=args.local_epochs,
                 device=device,
                 mu=0.0,
@@ -653,7 +726,7 @@ def main():
                     local_model.load_state_dict(client_bn_states[ci], strict=False)
                 local_optimizer = None
                 if keep_optimizer:
-                    local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
+                    local_optimizer = build_optimizer(local_model.parameters(), round_lr, args.weight_decay)
                     if client_opt_states[ci] is not None:
                         local_optimizer.load_state_dict(client_opt_states[ci])
                 train_stats = {}
@@ -661,7 +734,8 @@ def main():
                     model=local_model,
                     dataloader=step_iter,
                     criterion=criterion,
-                    lr=args.lr,
+                    lr=round_lr,
+                    weight_decay=args.weight_decay,
                     local_epochs=args.local_epochs,
                     device=device,
                     mu=effective_mu,
@@ -695,12 +769,19 @@ def main():
                 l * n for l, n in zip(prox_dists, client_sample_counts)
             ) / max(total_samples, 1)
 
+            if use_server_opt:
+                prev_params = {n: p.detach().cpu().clone() for n, p in global_model.named_parameters()}
             global_model = server_aggregate(
                 global_model=global_model,
                 client_models=local_models,
                 client_sample_counts=client_sample_counts,
                 skip_keys=bn_keys if use_fedbn else None,
             )
+            if use_server_opt:
+                apply_server_momentum(
+                    global_model, prev_params, server_velocity, args.server_momentum, args.server_lr,
+                    skip_names=set(bn_keys),
+                )
 
         # 글로벌 검증셋 및 클라이언트별 검증셋 평가 (test는 학습 종료 후 --final_test로 1회만 평가)
         eval_metrics = evaluate_model(
@@ -748,6 +829,7 @@ def main():
             "mu": effective_mu,
             "seed": args.seed,
             "eval_split": "val",
+            "lr": round(round_lr, 10),
             "train_loss": round(train_loss, 6),
             "val_loss": round(val_loss, 6),
             "balanced_acc": round(balanced_acc, 6),
@@ -821,6 +903,7 @@ def main():
                 "client_iterator_states": [it.state_dict() for it in client_step_iterators],
                 "client_optimizer_states": client_opt_states if keep_optimizer else None,
                 "client_bn_states": client_bn_states if use_fedbn else None,
+                "server_velocity": server_velocity if use_server_opt else None,
             },
             last_ckpt_path,
         )

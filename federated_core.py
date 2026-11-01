@@ -1,4 +1,5 @@
 import copy
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -158,6 +159,7 @@ def train_one_client(
     optimizer: torch.optim.Optimizer | None = None,
     num_updates: int | None = None,
     stats: dict | None = None,
+    weight_decay: float = 0.0,
 ) -> tuple[nn.Module, float]:
     """
     단일 클라이언트(또는 Centralized) 모델을 학습합니다.
@@ -178,6 +180,7 @@ def train_one_client(
         optimizer: 외부에서 유지하는 옵티마이저 (Centralized처럼 에폭 간 Adam 상태를 유지해야 할 때 전달).
                    None이면 호출 시마다 새 Adam을 생성 (연합학습 로컬 학습의 표준 방식)
         num_updates: 라운드당 로컬 업데이트(미니배치 스텝) 횟수. FLamby 공식 벤치마크는 100을 사용
+        weight_decay: >0이면 새로 만드는 옵티마이저를 AdamW(분리형 감쇠)로 사용 (외부 optimizer를 넘기면 무시)
         stats: 빈 dict를 넘기면 학습 후 추가 통계를 채워 줌 (반환 시그니처는 그대로).
                - "prox_loss": 스텝 평균 근접 항 기여분 (mu/2)*||w-w_global||^2 (mu==0이면 0.0)
                - "prox_dist": 스텝 평균 ||w-w_global||_2 (mu==0이면 0.0)
@@ -200,7 +203,11 @@ def train_one_client(
         global_params = None
 
     if optimizer is None:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = build_optimizer(model.parameters(), lr, weight_decay)
+    else:
+        # 외부에서 유지하는 옵티마이저도 이번 라운드의 학습률(스케줄 반영)을 쓰도록 맞춘다 (상수 lr이면 변화 없음)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
 
     total_base_loss = 0.0
     total_samples = 0
@@ -265,6 +272,58 @@ def train_one_client(
         stats["prox_dist"] = total_prox_dist / max(total_steps, 1)
         stats["steps"] = total_steps
     return model, avg_loss
+
+
+def build_optimizer(params, lr: float, weight_decay: float = 0.0) -> torch.optim.Optimizer:
+    """
+    기본(weight_decay=0)은 FLamby 공식과 같은 Adam. weight_decay>0이면 분리형(decoupled) 가중치 감쇠를 쓰는 AdamW.
+    (Adam의 L2 항은 적응형 학습률과 섞여 효과가 불분명하므로 AdamW를 쓴다.)
+    """
+    if weight_decay and weight_decay > 0.0:
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    return torch.optim.Adam(params, lr=lr)
+
+
+def lr_for_round(base_lr: float, schedule: str, round_idx: int, total_rounds: int, min_factor: float = 0.1) -> float:
+    """
+    라운드(centralized는 에폭) r의 학습률. round_idx는 1부터 시작.
+    - constant: 항상 base_lr (기본값, FLamby 공식과 같음)
+    - cosine  : 1라운드는 base_lr, 마지막 라운드는 base_lr*min_factor로 코사인 감소
+    - step    : 전체의 2/3 지점 이후 라운드부터 base_lr*0.5
+    """
+    if schedule == "constant":
+        return base_lr
+    if schedule == "cosine":
+        t = (round_idx - 1) / max(total_rounds - 1, 1)
+        return base_lr * (min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * t)))
+    if schedule == "step":
+        return base_lr * (0.5 if round_idx > math.ceil(total_rounds * 2 / 3) else 1.0)
+    raise ValueError(f"알 수 없는 lr 스케줄: {schedule}")
+
+
+def apply_server_momentum(
+    global_model: nn.Module,
+    prev_params: dict,
+    velocity: dict,
+    beta: float,
+    server_lr: float = 1.0,
+    skip_names: set | None = None,
+) -> None:
+    """
+    FedAvgM(서버 모멘텀). 집계된 평균 모델과 직전 글로벌 모델의 차이 delta를 모멘텀 v = beta*v + delta로 누적해
+    new = prev + server_lr * v 로 글로벌 파라미터를 갱신합니다. 파라미터만 대상으로 하고 BN 통계 같은 버퍼는 평균값 그대로 둡니다.
+    velocity는 호출 사이에 유지되는 dict(이름 -> CPU 텐서)이며 제자리에서 갱신됩니다.
+    """
+    skip = skip_names or set()
+    with torch.no_grad():
+        for name, p in global_model.named_parameters():
+            if name in skip:
+                continue
+            delta = p.detach().cpu() - prev_params[name]
+            v = velocity.get(name)
+            v = delta if v is None else beta * v + delta
+            velocity[name] = v
+            p.copy_((prev_params[name] + server_lr * v).to(p.device, dtype=p.dtype))
 
 
 def optimizer_state_to_cpu(state):

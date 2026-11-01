@@ -168,3 +168,73 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_lr_schedule_values():
+    from federated_core import lr_for_round
+
+    assert lr_for_round(1e-3, "constant", 5, 9) == 1e-3
+    assert abs(lr_for_round(1e-3, "cosine", 1, 9) - 1e-3) < 1e-12
+    assert abs(lr_for_round(1e-3, "cosine", 9, 9, 0.1) - 1e-4) < 1e-12
+    mid = lr_for_round(1e-3, "cosine", 5, 9, 0.1)
+    assert 1e-4 < mid < 1e-3
+    assert lr_for_round(1e-3, "step", 6, 9) == 1e-3 and lr_for_round(1e-3, "step", 7, 9) == 5e-4
+
+
+def test_lr_schedule_logged_and_decreasing(tmp_path):
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "3", "--seed", "11", "--lr_schedule", "cosine")
+    rows = _rows(tmp_path / "fedavg_cosine_seed11_metrics.csv")
+    lrs = [float(r["lr"]) for r in rows]
+    assert abs(lrs[0] - 5e-4) < 1e-12
+    assert lrs[0] > lrs[1] > lrs[2] > 0
+
+
+def test_default_lr_is_constant_in_csv(tmp_path):
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "2", "--seed", "12")
+    lrs = {float(r["lr"]) for r in _rows(tmp_path / "fedavg_seed12_metrics.csv")}
+    assert lrs == {5e-4}
+
+
+def test_weight_decay_uses_adamw_and_keeps_state(tmp_path):
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "1", "--seed", "13", "--keep_optimizer", "--weight_decay", "0.01")
+    ck = _load(tmp_path / "last_fedavg_keepopt_wd0.01_seed13.pt")
+    assert ck["client_optimizer_states"][0]["param_groups"][0]["weight_decay"] == 0.01
+    assert ck["config"]["weight_decay"] == 0.01
+    # centralized도 가중치 감쇠 옵션이 적용된다
+    run_main(tmp_path, "--method", "centralized", "--rounds", "1", "--seed", "13", "--weight_decay", "0.01")
+    ck2 = _load(tmp_path / "last_centralized_wd0.01_seed13.pt")
+    assert ck2["optimizer_state_dict"]["param_groups"][0]["weight_decay"] == 0.01
+
+
+def test_server_momentum_changes_update_and_resumes(tmp_path):
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "2", "--seed", "14")
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "1", "--seed", "14", "--server_momentum", "0.9")
+    ck = _load(tmp_path / "last_fedavg_svm0.9_seed14.pt")
+    vel = ck["server_velocity"]
+    assert vel and all(torch.isfinite(v).all() for v in vel.values())
+    first = {k: v.clone() for k, v in vel.items()}
+    run_main(tmp_path, "--method", "fedavg", "--rounds", "2", "--seed", "14", "--server_momentum", "0.9", "--resume")
+    ck2 = _load(tmp_path / "last_fedavg_svm0.9_seed14.pt")
+    assert any(not torch.allclose(first[k], ck2["server_velocity"][k]) for k in first)
+    assert len(_rows(tmp_path / "fedavg_svm0.9_seed14_metrics.csv")) == 2
+    # 모멘텀이 있으면 일반 FedAvg와 다른 글로벌 모델이 된다 (2라운드째부터)
+    plain = _load(tmp_path / "last_fedavg_seed14.pt")["model_state_dict"]["fc.weight"]
+    assert not torch.allclose(plain, ck2["model_state_dict"]["fc.weight"])
+
+
+def test_apply_server_momentum_math():
+    from federated_core import apply_server_momentum
+
+    m = nn.Linear(2, 1, bias=False)
+    prev = {"weight": torch.zeros(1, 2)}
+    with torch.no_grad():
+        m.weight.copy_(torch.tensor([[1.0, 2.0]]))      # 평균 모델 = prev + delta(1,2)
+    vel = {}
+    apply_server_momentum(m, prev, vel, beta=0.5, server_lr=1.0)
+    assert torch.allclose(m.weight, torch.tensor([[1.0, 2.0]]))            # 첫 라운드: v=delta
+    prev2 = {"weight": m.weight.detach().cpu().clone()}
+    with torch.no_grad():
+        m.weight.add_(torch.tensor([[1.0, 1.0]]))                           # 다음 delta=(1,1)
+    apply_server_momentum(m, prev2, vel, beta=0.5, server_lr=1.0)
+    assert torch.allclose(vel["weight"], torch.tensor([[1.5, 2.0]]))        # 0.5*(1,2)+(1,1)
+    assert torch.allclose(m.weight, torch.tensor([[2.5, 4.0]]))             # prev2 + v
