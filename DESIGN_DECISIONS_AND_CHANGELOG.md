@@ -172,7 +172,7 @@
 - 병원별(특히 Client 4, 5) 지표는 표본이 매우 작아 잡음이 큼. 부트스트랩 신뢰구간이나 큰 병원 기준 값 병기를 권장.
 - GPU 비결정 연산(예: AdaptiveAvgPool 역전파) 때문에 같은 시드라도 비트 단위로 같은 결과는 보장되지 않음.
 
-### 2026-11-01 — 6센터 Kaggle 결과 분석에 따른 확장 (브랜치 `feature/v2-keepopt-fedbn-analysis`)
+### 2026-11-01 — 6센터 Kaggle 결과 분석에 따른 확장 (브랜치 `feature/v2-extended-experiments`)
 
 근거: `results/fed_isic_6client_kaggle_1101/`의 분석(연합은 9라운드에서 아직 수렴하지 않았고 학습 손실이 중앙집중보다 높음, 연합은 NV로 쏠려 MEL·BCC·AK·SCC recall이 낮음, 센터 4가 무너지고 병원 간 격차가 중앙집중의 약 2배). 아래 변경은 **기본 동작을 바꾸지 않는 추가 기능**이며, 효과는 아직 실행해 확인하지 않은 가설이다.
 
@@ -188,4 +188,6 @@
 | **10.8** | `main.py`, `federated_core.py` | `--server_momentum β`(+`--server_lr`) 추가(FedAvgM). 집계 후 `v = β v + (avg - prev)`, `new = prev + server_lr * v`를 파라미터에만 적용(BN 통계 등 버퍼는 평균 그대로, FedBN에서는 BN 파라미터 제외). 속도 `v`는 `last_*.pt`에 저장되어 `--resume` 가능. 파일 이름에 `_svm<β>`. | 라운드 수가 적을 때 수렴을 빠르게 하는 후보. 효과는 미확인 가설. |
 | **10.9** | `main.py`, `federated_core.py` | `--weight_decay` 추가. 0보다 크면 `build_optimizer`가 Adam 대신 AdamW(분리형 감쇠)를 사용. Centralized와 연합 클라이언트(`--keep_optimizer` 포함) 모두 적용. 기본 0은 기존 Adam. 파일 이름에 `_wd<값>`. | Centralized에서 학습 손실만 계속 내려가고 검증 손실은 줄지 않는 약한 과적합 신호. 다만 val 손실은 가중 focal 때문에 잡음이 크고 성능 지표(balanced acc)는 유지되어 효과는 약할 수 있음. best-val 모델 평가(`final_test.json`의 `best_val`)는 이미 지원. |
 
-시드 5개로 확대: 기존 `42, 100, 2026`에 `7, 1234`를 추가(탐색 시드 `41`, μ 재확인 시드 `40`과 겹치지 않음). 실험 순서·비용·명령은 `EXPERIMENT_PLAN_V2.md` 참고.
+시드: 처음에는 5개로 확대할 계획이었으나(기존 `42, 100, 2026`에 `7, 1234` 추가) 실제 실행은 3개 시드 `42, 100, 2026`만 썼고 `7, 1234`는 실행하지 않았습니다. 탐색 시드 `41`, μ 재확인 시드 `40`은 그대로입니다. 실험 순서·비용·명령은 `EXPERIMENT_PLAN_V2.md` 참고.
+
+2026-11-02 실행 결과: 확장 실험 A(Kaggle 버전 3: FedAvg·FedProx μ=0.1 18라운드, FedBN 9라운드, 시드 42/100/2026)와 확장 실험 B(버전 4: μ 재확인으로 μ=0.3 선정, keep_optimizer+cosine+에폭 2 기준 18라운드의 FedAvg·FedProx·FedBN, 같은 3시드)를 실행했습니다. 결과와 해석은 `results/fed_isic_6client_kaggle_1102_v2/README.md`를 참고하세요(확장 실험 B 결과는 브랜치 `feature/v2-expB-notebooks`의 `results/fed_isic_6client_kaggle_1102_v2b/`에 있음). `--server_momentum`, `--weight_decay`, `--lr_schedule step`은 아직 실행하지 않았습니다.
