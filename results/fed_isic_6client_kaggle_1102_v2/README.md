@@ -1,7 +1,7 @@
 # Fed-ISIC2019 6-client — Kaggle 확장 실험 A 결과 (2026-11-02)
 
 Kaggle 노트북 버전 3("expA 18 rounds + FedBN", Save & Run All, GPU T4 x2, 29,136초 ≈ 8시간 5분)의 결과입니다.
-코드: 이 브랜치(`feature/v2-extended-experiments`), 노트북 `fed_isic2019_kaggle_v2_expA.ipynb`.
+코드: `main.py` 등은 브랜치 `feature/v2-extended-experiments`, 노트북은 브랜치 `feature/v2-expB-notebooks`의 `kaggle/fed_isic2019_kaggle_v2_expA.ipynb`.
 이전 9라운드 결과(Centralized, FedAvg, FedProx μ=0.1; 시드 42/100/2026)는 브랜치 `results/fed-isic-6client-1101`에서 읽었습니다.
 
 ## 무엇을 돌렸나
