@@ -1,0 +1,11 @@
+pair,metric,n_common_seeds,mean_diff,n_seeds_positive,min_diff,max_diff,boot_ci_low,boot_ci_high,ci_excludes_zero
+fedavg_r18 - fedavg,balanced_acc,3,0.0447,3,0.0275,0.0613,0.0325,0.0565,True
+fedavg_r18 - fedavg,macro_f1,3,0.0611,3,0.0274,0.0886,0.0502,0.0717,True
+fedprox_mu0.1_r18 - fedprox_mu0.1,balanced_acc,3,0.0332,3,0.0143,0.0501,0.0231,0.0429,True
+fedprox_mu0.1_r18 - fedprox_mu0.1,macro_f1,3,0.0586,3,0.0206,0.1045,0.0479,0.0689,True
+fedprox_mu0.1_r18 - fedavg_r18,balanced_acc,3,0.0249,3,0.0152,0.0318,0.0151,0.0352,True
+fedprox_mu0.1_r18 - fedavg_r18,macro_f1,3,0.0200,2,-0.0112,0.0602,0.0110,0.0300,True
+fedbn - fedavg,balanced_acc,3,0.0103,2,-0.0220,0.0264,-0.0013,0.0226,False
+fedbn - fedavg,macro_f1,3,0.0117,2,-0.0471,0.0448,0.0014,0.0223,True
+fedbn - fedprox_mu0.1,balanced_acc,3,-0.0261,1,-0.0680,0.0212,-0.0379,-0.0137,True
+fedbn - fedprox_mu0.1,macro_f1,3,-0.0108,1,-0.0825,0.0616,-0.0209,-0.0012,True
