@@ -1,59 +1,59 @@
-# Fed-ISIC2019 6-client — Kaggle extended experiment B (results, 2026-11-02)
+# Fed-ISIC2019 6-client — Kaggle 확장 실험 B 결과 (2026-11-02)
 
-Results of Kaggle notebook version 4 ("expB combined", Save & Run All, GPU T4 x2, ran 21,456 s ≈ 5 h 58 min, no failed runs).
-Code: this branch (`feature/v2-expB-notebooks`), notebook `kaggle/fed_isic2019_kaggle_v2_expB.ipynb`.
-Two jobs ran at the same time, one per GPU (job queue in the notebook). Test set was opened once per run (`--final_test`, last-round model).
+Kaggle 노트북 버전 4("expB combined", Save & Run All, GPU T4 x2, 21,456초 ≈ 5시간 58분, 실패한 실행 없음)의 결과입니다.
+코드: 이 브랜치(`feature/v2-expB-notebooks`), 노트북 `kaggle/fed_isic2019_kaggle_v2_expB.ipynb`.
+작업 두 개를 GPU 한 장에 하나씩 동시에 실행했습니다(노트북 안의 작업 큐). test 셋은 실행마다 한 번만 열었습니다(`--final_test`, 마지막 라운드 모델).
 
-## What was run
+## 무엇을 돌렸나
 
-| Part | Method | Setting | Seeds |
+| 구분 | 방법 | 설정 | 시드 |
 | :--- | :--- | :--- | :--- |
-| E1 (mu recheck, validation only) | FedAvg, FedProx mu=0.03/0.1/0.3 (and mu=0.03/0.3 on seed 41) | official setting: 100 updates, 9 rounds | 40, 41 |
-| Main | FedAvg, FedProx (selected mu), FedBN | `--keep_optimizer --lr_schedule cosine --num_updates 0 --local_epochs 2 --rounds 18` | 42, 100, 2026 |
+| E1 (μ 재확인, 검증만 사용) | FedAvg, FedProx μ=0.03/0.1/0.3 (시드 41에서는 μ=0.03/0.3) | 공식 설정: 100 업데이트, 9라운드 | 40, 41 |
+| 본 실험 | FedAvg, FedProx(선정된 μ), FedBN | `--keep_optimizer --lr_schedule cosine --num_updates 0 --local_epochs 2 --rounds 18` | 42, 100, 2026 |
 
-Common settings: Adam lr 5e-4, batch size 64, val_fraction 0.1, split_seed 0, `--resume`. FedBN keeps BatchNorm per center and is evaluated per center.
-Result file tag: `_keepopt_cosine_ep2`.
+공통 설정: Adam lr 5e-4, 배치 64, val_fraction 0.1, split_seed 0, `--resume`. FedBN은 BatchNorm을 센터별로 유지하고 센터별로 평가합니다.
+결과 파일 이름 꼬리표: `_keepopt_cosine_ep2`.
 
-## mu selection (E1, `e1_mu_recheck/best_mu.json`)
+## μ 선정 (E1, `e1_mu_recheck/best_mu.json`)
 
-Rule: mean over seeds 40 and 41 of the validation macro-F1 averaged over the last 3 rounds; ties go to the smaller mu. Seed 41 values for the other mu (0.001, 0.01, 1.0) come from the earlier results branch.
+규칙: 시드 40과 41에서 "마지막 3라운드 검증 macro-F1 평균"을 다시 평균해 가장 큰 μ를 고르고, 동률이면 작은 μ를 고릅니다. 시드 41의 다른 μ(0.001, 0.01, 1.0) 값은 이전 결과 브랜치에서 읽었습니다.
 
-| mu | seed 40 | seed 41 | mean |
+| μ | 시드 40 | 시드 41 | 평균 |
 | :--- | :---: | :---: | :---: |
 | 0.03 | 0.4938 | 0.5084 | 0.5011 |
 | 0.1 | 0.5206 | 0.5299 | 0.5252 |
 | **0.3** | 0.5244 | 0.5307 | **0.5275** |
 | (FedAvg) | 0.4859 | 0.5018 | |
 
-Selected mu = 0.3 (previously 0.1). The difference between 0.3 and 0.1 is 0.0023, which is small.
+선정된 μ = 0.3 (이전에는 0.1). 0.3과 0.1의 차이는 0.0023으로 작습니다.
 
-## Final test results (mean of 3 seeds, 95% bootstrap CI over test samples)
+## 최종 test 결과 (3시드 평균, test 표본 기준 95% 부트스트랩 구간)
 
-| Method | Bal Acc | Macro F1 |
+| 방법 | Bal Acc | Macro F1 |
 | :--- | :---: | :---: |
-| Centralized (9-round era baseline) | 0.7391 (0.7205–0.7579) | 0.6824 (0.6641–0.6986) |
-| FedAvg, keepopt+cosine, 2 epochs, 18 rounds | 0.7300 (0.7107–0.7491) | 0.7100 (0.6900–0.7278) |
-| FedProx mu=0.3, same setting | 0.7225 (0.7025–0.7418) | 0.6902 (0.6695–0.7086) |
-| FedBN, same setting | 0.7674 (0.7486–0.7860) | 0.7489 (0.7302–0.7654) |
-| (earlier) FedAvg 18 rounds, 100 updates | 0.6778 | 0.5689 |
-| (earlier) FedProx mu=0.1 18 rounds, 100 updates | 0.7027 | 0.5889 |
-| (earlier) FedBN 9 rounds | 0.6434 | 0.5196 |
+| Centralized (9라운드 시기 기준선) | 0.7391 (0.7205–0.7579) | 0.6824 (0.6641–0.6986) |
+| FedAvg, keepopt+cosine, 2에폭, 18라운드 | 0.7300 (0.7107–0.7491) | 0.7100 (0.6900–0.7278) |
+| FedProx μ=0.3, 같은 설정 | 0.7225 (0.7025–0.7418) | 0.6902 (0.6695–0.7086) |
+| FedBN, 같은 설정 | 0.7674 (0.7486–0.7860) | 0.7489 (0.7302–0.7654) |
+| (이전) FedAvg 18라운드, 100 업데이트 | 0.6778 | 0.5689 |
+| (이전) FedProx μ=0.1 18라운드, 100 업데이트 | 0.7027 | 0.5889 |
+| (이전) FedBN 9라운드 | 0.6434 | 0.5196 |
 
-Per seed (Bal Acc): FedAvg 0.7265 / 0.7401 / 0.7234, FedProx 0.7098 / 0.7295 / 0.7281, FedBN 0.7592 / 0.7730 / 0.7700 (seeds 42 / 100 / 2026).
+시드별 Bal Acc (시드 42 / 100 / 2026): FedAvg 0.7265 / 0.7401 / 0.7234, FedProx 0.7098 / 0.7295 / 0.7281, FedBN 0.7592 / 0.7730 / 0.7700.
 
-## Paired differences, same seeds (`analysis_extended/paired_summary.csv`, Bal Acc)
+## 같은 시드끼리 짝지은 차이 (`analysis_extended/paired_summary.csv`, Bal Acc)
 
-| Comparison | Mean diff | Seeds positive | Bootstrap CI excludes 0 |
+| 비교 | 평균 차이 | 차이가 양수인 시드 | 부트스트랩 구간이 0을 제외 |
 | :--- | :---: | :---: | :---: |
-| FedAvg new setting − FedAvg 18 rounds (100 updates) | +0.0523 | 3/3 | yes |
-| FedProx mu=0.3 new − FedProx mu=0.1 18 rounds (100 updates) | +0.0198 | 3/3 | yes |
-| FedProx − FedAvg (new setting) | −0.0076 | 1/3 | no (macro-F1: −0.0198, 0/3, yes) |
-| FedBN − FedAvg (new setting) | +0.0374 | 3/3 | yes |
-| FedBN − FedProx (new setting) | +0.0449 | 3/3 | yes |
+| FedAvg 새 설정 − FedAvg 18라운드(100 업데이트) | +0.0523 | 3/3 | 예 |
+| FedProx μ=0.3 새 설정 − FedProx μ=0.1 18라운드(100 업데이트) | +0.0198 | 3/3 | 예 |
+| FedProx − FedAvg (새 설정) | −0.0076 | 1/3 | 아니오 (macro-F1: −0.0198, 0/3, 예) |
+| FedBN − FedAvg (새 설정) | +0.0374 | 3/3 | 예 |
+| FedBN − FedProx (새 설정) | +0.0449 | 3/3 | 예 |
 
-## Per center (Bal Acc, mean of 3 seeds; test samples 2483 / 791 / 672 / 452 / 164 / 88)
+## 센터별 (Bal Acc, 3시드 평균; test 표본 수 2483 / 791 / 672 / 452 / 164 / 88)
 
-| Center | FedAvg | FedProx | FedBN |
+| 센터 | FedAvg | FedProx | FedBN |
 | :--- | :---: | :---: | :---: |
 | 0 | 0.804 | 0.789 | 0.812 |
 | 1 | 0.686 | 0.712 | 0.825 |
@@ -62,22 +62,22 @@ Per seed (Bal Acc): FedAvg 0.7265 / 0.7401 / 0.7234, FedProx 0.7098 / 0.7295 / 0
 | 4 | 0.422 | 0.447 | 0.603 |
 | 5 | 0.753 | 0.789 | 0.760 |
 
-FedBN − FedAvg: center 4 +0.181 (CI 0.124–0.239), center 5 +0.007 (−0.132–0.144). FedBN − FedProx: center 4 +0.156 (0.098–0.216), center 5 −0.029 (−0.159–0.097).
+FedBN − FedAvg: 센터 4 +0.181 (구간 0.124–0.239), 센터 5 +0.007 (−0.132–0.144). FedBN − FedProx: 센터 4 +0.156 (0.098–0.216), 센터 5 −0.029 (−0.159–0.097).
 
-Melanoma (MEL) recall, mean of 3 seeds (`analysis_extended/per_class_recall.csv`): Centralized 0.742, FedBN 0.728, FedAvg 0.651, FedProx 0.608.
+흑색종(MEL) 재현율, 3시드 평균(`analysis_extended/per_class_recall.csv`): Centralized 0.742, FedBN 0.728, FedAvg 0.651, FedProx 0.608.
 
-## Caveats
+## 한계
 
-- Several factors changed together (keep_optimizer, cosine schedule, epoch-based local training, 18 rounds), so this experiment cannot say how much each one contributed.
-- FedBN is evaluated per center with that center's own BatchNorm state, while FedAvg/FedProx are evaluated as a single server model. The evaluated objects differ.
-- Only 3 seeds. The bootstrap intervals reflect test-sample variation only; seed-to-seed variation is in `analysis_extended/paired_by_seed.csv`.
-- Center 5 has 88 test samples (center 4: 164), so per-center differences there are noisy.
-- The selected mu=0.3 beat 0.1 by a small margin (0.0023 in validation macro-F1).
+- 여러 요인(keep_optimizer, cosine 학습률, 에폭 기준 로컬 학습, 18라운드)을 한꺼번에 바꿨기 때문에 각 요인이 얼마나 기여했는지는 이 실험만으로 알 수 없습니다.
+- FedBN은 센터마다 자기 BatchNorm 상태로 평가하고 FedAvg/FedProx는 서버 모델 하나로 평가합니다. 평가 대상이 다릅니다.
+- 시드가 3개뿐입니다. 부트스트랩 구간은 test 표본의 불확실성만 반영하며, 시드 사이 변동은 `analysis_extended/paired_by_seed.csv`에 있습니다.
+- 센터 5의 test는 88장(센터 4는 164장)이라 그 센터의 센터별 차이는 잡음이 큽니다.
+- 선정된 μ=0.3은 0.1보다 근소하게 앞섰습니다(검증 macro-F1 차이 0.0023).
 
-## Files
+## 파일
 
-- `<method>_keepopt_cosine_ep2_seed<seed>_final_test.json / _final_test_preds.npz / _metrics.csv / _env.json`: main runs (3 methods x 3 seeds; FedProx files carry `mu0.3` in the name).
-- `e1_mu_recheck/`: E1 metrics CSVs, env files and `best_mu.json`.
-- `analysis_extended/`: output of `analysis/analyze_extended.py` (all pairs, same numbers as the notebook's own analysis plus FedBN − FedProx).
-- `kaggle_version4_full_log.txt`: full Kaggle log of version 4.
-- Checkpoints (`.pt`) and the Kaggle output archives are not included.
+- `<방법>_keepopt_cosine_ep2_seed<시드>_final_test.json / _final_test_preds.npz / _metrics.csv / _env.json`: 본 실험 실행 결과(3개 방법 × 3개 시드, FedProx 파일 이름에는 `mu0.3`이 들어감).
+- `e1_mu_recheck/`: E1의 metrics CSV, env 파일, `best_mu.json`.
+- `analysis_extended/`: `analysis/analyze_extended.py`의 출력(모든 짝 비교; 노트북 자체 분석과 숫자가 같고 FedBN − FedProx가 추가됨).
+- `kaggle_version4_full_log.txt`: Kaggle 버전 4의 전체 로그.
+- 체크포인트(`.pt`)와 Kaggle 출력 압축 파일은 포함하지 않았습니다.
