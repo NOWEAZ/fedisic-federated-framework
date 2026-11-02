@@ -1,0 +1,17 @@
+pair,metric,n_common_seeds,mean_diff,n_seeds_positive,min_diff,max_diff,boot_ci_low,boot_ci_high,ci_excludes_zero
+fedavg_keepopt_cosine_ep2 - fedavg_r18,balanced_acc,3,0.0523,3,0.0457,0.0598,0.0375,0.0678,True
+fedavg_keepopt_cosine_ep2 - fedavg_r18,macro_f1,3,0.1411,3,0.1010,0.1674,0.1266,0.1565,True
+fedprox_mu0.3_keepopt_cosine_ep2 - fedprox_mu0.1_r18,balanced_acc,3,0.0198,3,0.0068,0.0352,0.0076,0.0319,True
+fedprox_mu0.3_keepopt_cosine_ep2 - fedprox_mu0.1_r18,macro_f1,3,0.1013,3,0.0783,0.1159,0.0877,0.1146,True
+fedprox_mu0.3_keepopt_cosine_ep2 - fedavg_keepopt_cosine_ep2,balanced_acc,3,-0.0076,1,-0.0167,0.0047,-0.0173,0.0014,False
+fedprox_mu0.3_keepopt_cosine_ep2 - fedavg_keepopt_cosine_ep2,macro_f1,3,-0.0198,0,-0.0289,-0.0024,-0.0301,-0.0096,True
+fedbn_keepopt_cosine_ep2 - fedavg_keepopt_cosine_ep2,balanced_acc,3,0.0374,3,0.0327,0.0465,0.0254,0.0498,True
+fedbn_keepopt_cosine_ep2 - fedavg_keepopt_cosine_ep2,macro_f1,3,0.0389,3,0.0227,0.0532,0.0269,0.0506,True
+fedbn_keepopt_cosine_ep2 - fedprox_mu0.3_keepopt_cosine_ep2,balanced_acc,3,0.0449,3,0.0419,0.0494,0.0316,0.0589,True
+fedbn_keepopt_cosine_ep2 - fedprox_mu0.3_keepopt_cosine_ep2,macro_f1,3,0.0586,3,0.0507,0.0696,0.0460,0.0722,True
+fedbn_keepopt_cosine_ep2 - fedbn,balanced_acc,3,0.1240,3,0.0851,0.1594,0.1095,0.1384,True
+fedbn_keepopt_cosine_ep2 - fedbn,macro_f1,3,0.2293,3,0.1908,0.2685,0.2136,0.2458,True
+fedavg_keepopt_cosine_ep2 - fedavg,balanced_acc,3,0.0969,3,0.0788,0.1211,0.0812,0.1132,True
+fedavg_keepopt_cosine_ep2 - fedavg,macro_f1,3,0.2021,3,0.1682,0.2434,0.1854,0.2190,True
+fedprox_mu0.3_keepopt_cosine_ep2 - fedprox_mu0.1,balanced_acc,3,0.0530,3,0.0495,0.0569,0.0372,0.0668,True
+fedprox_mu0.3_keepopt_cosine_ep2 - fedprox_mu0.1,macro_f1,3,0.1599,3,0.1303,0.1828,0.1432,0.1743,True
