@@ -12,6 +12,7 @@ from data_utils import (
     LR,
     NUM_CLIENTS,
     NUM_EPOCHS_POOLED,
+    Optimizer,
     get_dataloaders,
     get_nb_max_rounds,
 )
@@ -390,7 +391,7 @@ def main():
     # 2. FLamby 공식 손실 함수 (BaselineLoss: Weighted Focal Loss) 초기화
     criterion = build_baseline_loss(device=device)
 
-    # 3. 글로벌 모델 초기화 및 1라운드당 통신량(MB) 계산
+    # 3. 글로벌 모델(FLamby 공식 Baseline: EfficientNet-B0) 초기화 및 1라운드당 통신량(MB) 계산
     global_model = build_efficientnet_b0(num_classes=8, pretrained=True).to(device)
     model_size_mb = compute_model_size_mb(global_model)
     round_comm_mb = (
@@ -403,13 +404,20 @@ def main():
         f"Comm Volume per Round (Down+Up): {round_comm_mb:.2f} MB"
     )
 
-    # Centralized는 에폭 간 Adam 모멘텀을 유지해야 하므로 옵티마이저를 루프 밖에서 1회만 생성
-    # (연합학습은 라운드마다 클라이언트 로컬 옵티마이저를 새로 생성하는 표준 방식을 따름)
-    central_optimizer = (
-        torch.optim.Adam(global_model.parameters(), lr=args.lr)
-        if args.method == "centralized"
-        else None
-    )
+    # FLamby 공식 구현(_Model 및 Optimizer = torch.optim.Adam)과 동일하게 옵티마이저를 루프 밖에서 1회 생성해 상태 유지:
+    # - Centralized: 단일 글로벌 모델에 대한 central_optimizer 유지
+    # - 연합학습(FedAvg/FedProx): 6개 클라이언트별 로컬 모델(client_models)과 로컬 옵티마이저(client_optimizers)를
+    #   루프 밖에서 1회 생성하고, 매 라운드 글로벌 가중치만 load_state_dict로 동기화하여 Adam 모멘텀 상태를 유지
+    if args.method == "centralized":
+        central_optimizer = Optimizer(global_model.parameters(), lr=args.lr)
+        client_models = None
+        client_optimizers = None
+    else:
+        central_optimizer = None
+        client_models = [copy.deepcopy(global_model) for _ in range(num_clients)]
+        client_optimizers = [
+            Optimizer(m.parameters(), lr=args.lr) for m in client_models
+        ]
 
     # 4. 결과 기록용 CSV 및 모델 저장 경로 설정 (시드 및 FedProx mu 값 구분)
     if args.method == "fedprox":
@@ -457,6 +465,14 @@ def main():
         global_model.to(device)
         if central_optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
             central_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if client_models is not None:
+            for c_model in client_models:
+                c_model.load_state_dict(global_model.state_dict())
+                c_model.to(device)
+            saved_client_opts = ckpt.get("client_optimizer_state_dicts")
+            if client_optimizers is not None and saved_client_opts is not None:
+                for c_opt, opt_state in zip(client_optimizers, saved_client_opts):
+                    c_opt.load_state_dict(opt_state)
         best_balanced_acc = ckpt["best_balanced_acc"]
         start_round = ckpt["round"] + 1
         _restore_rng_states(ckpt["rng_states"], client_loaders, centralized_loader)
@@ -499,10 +515,14 @@ def main():
             local_losses = []
             divergences = []
 
-            for step_iter in client_step_iterators:
-                local_model = copy.deepcopy(global_model)
+            for c_model, c_opt, step_iter in zip(
+                client_models, client_optimizers, client_step_iterators
+            ):
+                # FLamby _Model과 동일하게 로컬 모델 파라미터에 현재 글로벌 가중치를 인플레이스 동기화하되,
+                # 파라미터 텐서 인스턴스와 로컬 옵티마이저(Adam 모멘텀 상태)는 라운드 간 그대로 유지
+                c_model.load_state_dict(global_model.state_dict())
                 trained_local_model, c_loss = train_one_client(
-                    model=local_model,
+                    model=c_model,
                     dataloader=step_iter,
                     criterion=criterion,
                     lr=args.lr,
@@ -510,6 +530,7 @@ def main():
                     device=device,
                     mu=effective_mu,
                     global_model=global_model,
+                    optimizer=c_opt,
                     num_updates=effective_num_updates,
                 )
 
@@ -635,6 +656,11 @@ def main():
                 "model_state_dict": global_model.state_dict(),
                 "optimizer_state_dict": (
                     central_optimizer.state_dict() if central_optimizer is not None else None
+                ),
+                "client_optimizer_state_dicts": (
+                    [c_opt.state_dict() for c_opt in client_optimizers]
+                    if client_optimizers is not None
+                    else None
                 ),
                 "rng_states": _capture_rng_states(client_loaders, centralized_loader),
             },

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torchvision import models
 from sklearn.metrics import balanced_accuracy_score, f1_score
 from tqdm import tqdm
-from flamby.datasets.fed_isic2019 import BaselineLoss
+from flamby.datasets.fed_isic2019 import Baseline, BaselineLoss, Optimizer
 
 
 class ClientStepIterator:
@@ -36,8 +36,16 @@ class ClientStepIterator:
 
 def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.Module:
     """
-    ImageNet 사전학습된 EfficientNet-B0를 불러오고 분류기를 num_classes(기본 8)로 교체합니다.
+    FLamby Fed-ISIC2019 공식 Baseline 모델(ImageNet 사전학습 EfficientNet-B0, 8클래스 분류기)을 생성합니다.
+    - pretrained=True이고 num_classes=8(기본값)일 때 FLamby 공식 `Baseline()`을 우선 반환합니다.
+    - 커스텀 클래스 수이거나 Baseline 초기화가 불가능한 환경에서는 torchvision의 EfficientNet-B0로 대체합니다.
     """
+    if pretrained and num_classes == 8:
+        try:
+            return Baseline()
+        except Exception:
+            pass
+
     try:
         weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
         model = models.efficientnet_b0(weights=weights)
@@ -135,8 +143,10 @@ def train_one_client(
         device: 학습 디바이스
         mu: FedProx 근접 항 계수 (0.0이면 FedAvg)
         global_model: FedProx 기준이 되는 글로벌 모델 (None이면 학습 시작 시점의 model 스냅샷 사용)
-        optimizer: 외부에서 유지하는 옵티마이저 (Centralized처럼 에폭 간 Adam 상태를 유지해야 할 때 전달).
-                   None이면 호출 시마다 새 Adam을 생성 (연합학습 로컬 학습의 표준 방식)
+        optimizer: 외부에서 유지하는 옵티마이저.
+                   FLamby 공식 구현(_Model)과 동일하게 연합학습(client_optimizers[k]) 및
+                   Centralized(central_optimizer) 모두 라운드/에폭 간 Adam 상태를 유지합니다.
+                   None이면 FLamby 공식 Optimizer(torch.optim.Adam)를 새로 생성합니다.
         num_updates: 라운드당 로컬 업데이트(미니배치 스텝) 횟수. FLamby 공식 벤치마크는 100을 사용
 
     Returns:
@@ -156,7 +166,7 @@ def train_one_client(
         global_params = None
 
     if optimizer is None:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = Optimizer(model.parameters(), lr=lr)
 
     total_base_loss = 0.0
     total_samples = 0

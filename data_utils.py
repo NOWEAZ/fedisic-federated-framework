@@ -8,8 +8,10 @@ from flamby.datasets.fed_isic2019 import (
     LR,
     NUM_CLIENTS,
     NUM_EPOCHS_POOLED,
+    Baseline,
     BaselineLoss,
     FedIsic2019,
+    Optimizer,
     get_nb_max_rounds,
 )
 
@@ -212,7 +214,7 @@ def get_dataloaders(
         )
 
     # 3. Global Validation/Test DataLoader (전체 6개 센터 통합) 및 클라이언트별 평가 DataLoader
-    # 클라이언트 간 최고-최저 Macro-F1(공정성 지표) 계산을 위해 클라이언트별 로더를 속성으로 연결
+    # 클라이언트 간 공정성 지표(Std, Gap) 및 병원별 지표 계산을 위해 클라이언트별 로더를 속성으로 연결
     val_loader = _make_eval_loader(ConcatDataset(client_val_datasets))
     val_loader.client_eval_loaders = [_make_eval_loader(ds) for ds in client_val_datasets]
 
