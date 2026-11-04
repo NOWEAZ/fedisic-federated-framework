@@ -16,6 +16,7 @@ from data_utils import (
     get_dataloaders,
     get_nb_max_rounds,
 )
+from lr_schedule import LR_SCHEDULES, round_lr
 from federated_core import (
     ClientStepIterator,
     build_baseline_loss,
@@ -55,6 +56,7 @@ CSV_FIELDS = [
     *[f"macro_f1_fixed8_client{k}" for k in range(NUM_CLIENTS)],
     "weight_divergence",
     "cumulative_comm_mb",
+    "lr",
 ]
 
 # resume 시 기존 체크포인트와 반드시 일치해야 하는 실험 설정 키
@@ -68,7 +70,11 @@ RESUME_CONFIG_KEYS = [
     "batch_size",
     "val_fraction",
     "split_seed",
+    "lr_schedule",
+    "lr_min_ratio",
 ]
+# 이 옵션이 추가되기 전에 만든 체크포인트에는 키가 없으므로, 없으면 기본값(기존 동작)으로 간주한다.
+RESUME_CONFIG_DEFAULTS = {"lr_schedule": "constant", "lr_min_ratio": 0.0}
 
 
 def set_seed(seed: int):
@@ -129,6 +135,20 @@ def parse_args():
         type=float,
         default=LR,
         help=f"학습률 Learning Rate (FLamby 공식 기본값: {LR})",
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="constant",
+        choices=list(LR_SCHEDULES),
+        help="라운드(Centralized는 에폭) 단위 학습률 스케줄. constant=FLamby 공식(기본), "
+             "cosine=1라운드 --lr에서 시작해 코사인으로 감소",
+    )
+    parser.add_argument(
+        "--lr_min_ratio",
+        type=float,
+        default=0.0,
+        help="cosine 스케줄의 하한 비율 (최저 lr = --lr * 이 값). constant에서는 무시",
     )
     parser.add_argument(
         "--mu",
@@ -424,6 +444,11 @@ def main():
         exp_tag = f"{args.method}_mu{effective_mu:g}"
     else:
         exp_tag = f"{args.method}"
+    if args.lr_schedule != "constant":
+        # 기본(constant) 실험과 결과 파일이 섞이지 않도록 태그에 스케줄을 반영
+        exp_tag += f"_{args.lr_schedule}"
+        if args.lr_min_ratio > 0:
+            exp_tag += f"min{args.lr_min_ratio:g}"
 
     csv_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_metrics.csv")
     best_model_path = os.path.join(args.save_dir, f"best_{exp_tag}_seed{args.seed}.pt")
@@ -440,6 +465,8 @@ def main():
         "batch_size": args.batch_size,
         "val_fraction": args.val_fraction,
         "split_seed": args.split_seed,
+        "lr_schedule": args.lr_schedule,
+        "lr_min_ratio": args.lr_min_ratio,
     }
 
     start_round = 1
@@ -453,12 +480,14 @@ def main():
             ckpt = torch.load(last_ckpt_path, map_location="cpu")
         saved_config = ckpt.get("config", {})
         mismatched = [
-            k for k in RESUME_CONFIG_KEYS if saved_config.get(k) != run_config[k]
+            k
+            for k in RESUME_CONFIG_KEYS
+            if saved_config.get(k, RESUME_CONFIG_DEFAULTS.get(k)) != run_config[k]
         ]
         if mismatched:
             raise ValueError(
                 f"[Resume] 체크포인트 설정과 현재 인자가 다릅니다: "
-                + ", ".join(f"{k} (ckpt={saved_config.get(k)}, now={run_config[k]})" for k in mismatched)
+                + ", ".join(f"{k} (ckpt={saved_config.get(k, RESUME_CONFIG_DEFAULTS.get(k))}, now={run_config[k]})" for k in mismatched)
             )
 
         global_model.load_state_dict(ckpt["model_state_dict"])
@@ -495,6 +524,14 @@ def main():
 
     # 6. 라운드별 학습 및 평가 루프
     for r in range(start_round, args.rounds + 1):
+        # 라운드별 학습률 (constant면 항상 args.lr). Adam의 모멘텀 상태는 그대로 두고 lr만 갱신한다.
+        round_learning_rate = round_lr(
+            args.lr, r, args.rounds, args.lr_schedule, args.lr_min_ratio
+        )
+        for opt in ([central_optimizer] if central_optimizer is not None else client_optimizers):
+            for group in opt.param_groups:
+                group["lr"] = round_learning_rate
+
         if args.method == "centralized":
             global_model, train_loss = train_one_client(
                 model=global_model,
@@ -582,7 +619,7 @@ def main():
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Bal Acc: {balanced_acc:.4f} (Std: {bal_acc_std:.4f}, Gap: {bal_acc_gap:.4f}) | "
             f"Macro F1: {macro_f1:.4f} (Std: {macro_f1_std:.4f}, Gap: {macro_f1_gap:.4f}) | "
-            f"ECE: {ece:.4f} | Weight Div: {avg_divergence:.4f} | "
+            f"ECE: {ece:.4f} | Weight Div: {avg_divergence:.4f} | LR: {round_learning_rate:.2e} | "
             f"Comm: {cumulative_comm_mb:.1f} MB"
         )
 
@@ -609,6 +646,7 @@ def main():
             "bal_acc_std": round(bal_acc_std, 6),
             "weight_divergence": round(avg_divergence, 6),
             "cumulative_comm_mb": round(cumulative_comm_mb, 2),
+            "lr": round_learning_rate,
         }
         for k in range(NUM_CLIENTS):
             row_data[f"balanced_acc_client{k}"] = round(client_bal_acc[k], 6)
