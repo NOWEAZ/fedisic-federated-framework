@@ -9,8 +9,18 @@
 - Centralized: 20에폭. 검증 90/10 층화 분할, 테스트는 `--final_test`로 1회
 - 시드: 탐색 41, 본실험 42/100/2026
 
+**main의 결과 (8af4275, `results/`, 시드 42/100/2026 test 1회 평가, 9라운드)**
+
+| 방법 | balanced acc | macro-F1 | 병원 간 bal-acc std | ECE |
+|---|---|---|---|---|
+| Centralized (20에폭) | 0.7293 ± 0.0180 | 0.6719 | 0.0668 | 0.0284 |
+| FedAvg | 0.6768 ± 0.0085 | 0.5826 | 0.1274 | 0.1008 |
+| FedProx (μ=0.1) | 0.6561 ± 0.0085 | 0.5676 | 0.1172 | 0.0899 |
+
+FedProx는 전체 balanced acc가 FedAvg보다 낮고(−2.1%p), 병원 간 편차·ECE·드리프트만 좋다. μ는 시드 41 val 마지막 3라운드 평균으로 0.1을 골랐다(0.1: 0.663, 1.0: 0.618).
+
 **알려진 한계 / 주의**
-- main에는 커밋된 결과가 없다. 이전 Kaggle 결과(Centralized 0.739, FedAvg 0.633, FedProx 0.670)는
+- 이전 Kaggle 결과(Centralized 0.739, FedAvg 0.633, FedProx 0.670)는
   클라이언트 Adam을 라운드마다 초기화하던 브랜치(`fix/notebook-source-resume-state`)의 값이라 **main의 베이스라인이 아니다**.
 - 에폭 중간 `ClientStepIterator` 위치는 체크포인트에 저장되지 않아 `--resume`이 비트 단위로 동일하지 않다.
 - 센터 4·5의 val/test 표본이 매우 작아(val 65/35장, test 164/88장) 병원별 지표는 잡음이 크다.
