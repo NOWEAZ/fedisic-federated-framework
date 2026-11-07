@@ -66,6 +66,7 @@ RESUME_CONFIG_KEYS = [
     "seed",
     "lr",
     "num_updates",
+    "rounds",  # cosine 스케줄은 총 라운드 수에 의존하므로 resume 시 달라지면 안 된다
     "local_epochs",
     "batch_size",
     "val_fraction",

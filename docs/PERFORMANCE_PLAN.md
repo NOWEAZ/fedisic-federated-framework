@@ -49,3 +49,16 @@ python main.py --method fedavg --seed 42 --data_path ./isic_data --save_dir ./re
 python main.py --method fedavg --seed 42 --lr_schedule cosine --data_path ./isic_data --save_dir ./results/cosine --resume --final_test
 ```
 FedProx는 베이스라인 FedAvg 결과로 효과가 확인된 뒤에 같은 방식으로 추가한다.
+
+## 5. FedProx 18라운드 + cosine 실험 (이 브랜치 `perf/fedprox-r18-cosine`)
+FedProx를 연합 알고리즘으로 확정하고, FedProx만 아래 두 요인을 함께 바꿔 3시드로 실행한다.
+- 라운드 9 → 18 (`--rounds 18`): 알고리즘 개선이 아니라 학습 예산 증가이므로 보고서에 그렇게 표기한다.
+- `--lr_schedule cosine`: 라운드마다 lr 감쇠 (1라운드 5e-4 → 18라운드 약 3.8e-6).
+
+```bash
+bash scripts/run_fedprox_r18_cosine.sh <data_path>            # μ=0.1, 시드 42/100/2026, 결과: ./results_fedprox_r18_cosine
+LR_SCHEDULE=constant bash scripts/run_fedprox_r18_cosine.sh <data_path>   # (선택) 18라운드만, 요인 분리용
+```
+비교 기준은 main의 FedProx(μ=0.1, 9R) test balanced acc 0.6561과 FedAvg 0.6768(3시드 평균).
+두 요인을 함께 바꾸므로 효과가 라운드 증가인지 cosine인지는 위 선택 실행(18R constant)을 해야 분리된다.
+`rounds`는 이제 resume 설정 일치 검사 대상이다(cosine이 총 라운드 수에 의존하기 때문).
