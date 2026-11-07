@@ -149,4 +149,4 @@
 | **8.3** | `federated_core.py` | **`BatchNorm2d` 단일 샘플 배치 방어** | 미니배치 크기가 1일 때(`images.size(0) == 1`) `BatchNorm2d` 분산 계산 에러(`ValueError`)가 발생하지 않도록 건너뛰되, `num_updates` 스텝 카운트는 차감하지 않아 정확한 업데이트 횟수 보장. |
 | **8.4** | `main.py` | **클라이언트별 `Optimizer` 모멘텀 상태 유지** | FLamby 공식 `_Model`과 동일하게 6개 클라이언트의 로컬 모델과 `Optimizer`(`Adam`)를 루프 밖에서 1회 생성해 라운드 간 모멘텀을 유지함. |
 | **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·6개 `client_optimizers`·난수 상태를 저장하며, `.tmp` 작성 후 `os.replace`로 원자적 교체를 수행함. |
-| **8.7** | `lr_schedule.py`, `main.py` | **라운드별 cosine lr 감쇠 및 resume 일치 검사** | torch 없이 테스트 가능한 순수 파이썬 스케줄러로 분리(`tests/test_lr_schedule.py`). `lr_schedule`, `lr_min_ratio`, `rounds`가 체크포인트와 다르면 resume을 막아 스케줄이 몰래 바뀌는 것을 방지하고, CSV에 `lr` 열을 기록함. |
+| **8.6** | `lr_schedule.py`, `main.py` | **라운드별 cosine lr 감쇠 및 resume 일치 검사** | torch 없이 테스트 가능한 순수 파이썬 스케줄러로 분리(`tests/test_lr_schedule.py`). `lr_schedule`, `lr_min_ratio`, `rounds`가 체크포인트와 다르면 resume을 막아 스케줄이 몰래 바뀌는 것을 방지하고, CSV에 `lr` 열을 기록함. |
