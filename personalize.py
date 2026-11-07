@@ -80,6 +80,13 @@ def parse_args():
 
 
 # ---------------------------------------------------------------- 모델 설정
+HEAD_PREFIXES = ("classifier", "base_model._fc", "_fc", "fc")  # torchvision: classifier, FLamby Baseline: base_model._fc
+
+
+def _is_head_param(name: str) -> bool:
+    return any(name == p or name.startswith(p + ".") for p in HEAD_PREFIXES)
+
+
 def configure_trainable(model: nn.Module, scope: str):
     """scope에 맞춰 requires_grad를 설정하고 학습 대상 파라미터 리스트를 반환."""
     for prm in model.parameters():
@@ -87,11 +94,12 @@ def configure_trainable(model: nn.Module, scope: str):
     if scope in ("head", "bn_head"):
         n_head = 0
         for name, prm in model.named_parameters():
-            if name.startswith("classifier"):
+            if _is_head_param(name):
                 prm.requires_grad = True
                 n_head += 1
         if n_head == 0:
-            raise RuntimeError("이름이 'classifier'로 시작하는 파라미터를 찾지 못했습니다. 모델 구조를 확인하세요.")
+            names = [n for n, _ in model.named_parameters()][-4:]
+            raise RuntimeError(f"마지막 분류 층 파라미터를 찾지 못했습니다(HEAD_PREFIXES={HEAD_PREFIXES}). 마지막 파라미터 이름: {names}")
     if scope == "bn_head":
         for m in model.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -101,12 +109,9 @@ def configure_trainable(model: nn.Module, scope: str):
 
 
 def set_train_mode(model: nn.Module, scope: str):
-    """head 범위에서는 BN 통계가 바뀌지 않도록 백본을 eval로 두고 마지막 층만 train으로 둔다."""
+    """head 범위에서는 BN 통계와 드롭아웃이 바뀌지 않도록 모델 전체를 eval로 두고 마지막 층의 가중치만 학습한다."""
     if scope == "head":
         model.eval()
-        for name, child in model.named_children():
-            if name.startswith("classifier"):
-                child.train()
     else:
         model.train()
 
@@ -145,6 +150,7 @@ def _adabn_client(global_model, loader, marks, ctx, k, val_loader=None):
     bns = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
     if not bns:
         raise RuntimeError("BatchNorm2d 층을 찾지 못했습니다.")
+    orig_momentum = [m.momentum for m in bns]
     for m in bns:
         m.reset_running_stats()
         m.momentum = None  # 누적 이동 평균 (배치 통계의 단순 평균)
@@ -164,8 +170,8 @@ def _adabn_client(global_model, loader, marks, ctx, k, val_loader=None):
                 probs, y_true = predict(model, val_loader, device, ctx["criterion"])
                 scores[step] = masked_metrics(y_true, probs, ctx["present"][k])[2]
                 model.train()
-    for m in bns:
-        m.momentum = 0.1
+    for m, mom in zip(bns, orig_momentum):
+        m.momentum = mom
     model.eval()
     return model, scores
 
