@@ -62,3 +62,6 @@ LR_SCHEDULE=constant bash scripts/run_fedprox_r18_cosine.sh <data_path>   # (선
 비교 기준은 main의 FedProx(μ=0.1, 9R) test balanced acc 0.6561과 FedAvg 0.6768(3시드 평균).
 두 요인을 함께 바꾸므로 효과가 라운드 증가인지 cosine인지는 위 선택 실행(18R constant)을 해야 분리된다.
 `rounds`는 이제 resume 설정 일치 검사 대상이다(cosine이 총 라운드 수에 의존하기 때문).
+
+이 브랜치는 FedProx만 지원한다. `main.py`에서 Centralized/FedAvg 경로를 제거했고, `--mu`는 0보다 커야 한다
+(기본값 0.1). 비교용 Centralized/FedAvg 수치는 main의 기존 결과를 쓴다.

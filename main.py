@@ -92,22 +92,22 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fed-ISIC2019 6-Client Federated Learning (Centralized / FedAvg / FedProx)"
+        description="Fed-ISIC2019 6-Client Federated Learning (FedProx)"
     )
     parser.add_argument(
         "--method",
         type=str,
-        default="fedavg",
-        choices=["centralized", "fedavg", "fedprox"],
-        help="학습 방식 선택: centralized, fedavg, fedprox",
+        default="fedprox",
+        choices=["fedprox"],
+        help="학습 방식. 이 브랜치는 FedProx만 지원합니다(Centralized/FedAvg 경로 제거).",
     )
     parser.add_argument(
         "--rounds",
         type=int,
         default=None,
         help=(
-            "총 통신 라운드 수. 미지정(None) 시 FLamby 공식 스케줄 자동 적용: "
-            f"연합학습은 get_nb_max_rounds(num_updates), centralized는 NUM_EPOCHS_POOLED({NUM_EPOCHS_POOLED})"
+            "총 통신 라운드 수. 미지정(None) 시 FLamby 공식 스케줄 get_nb_max_rounds(num_updates) 자동 적용. "
+            "cosine lr 스케줄은 이 값에 맞춰 감쇠한다."
         ),
     )
     parser.add_argument(
@@ -115,7 +115,7 @@ def parse_args():
         type=int,
         default=100,
         help=(
-            "연합학습(fedavg/fedprox)에서 라운드당 클라이언트 로컬 미니배치 업데이트(step) 횟수 "
+            "라운드당 클라이언트 로컬 미니배치 업데이트(step) 횟수 "
             "(FLamby 공식 벤치마크 기본값: 100). 0 이하로 주면 --local_epochs 기반으로 동작"
         ),
     )
@@ -123,7 +123,7 @@ def parse_args():
         "--local_epochs",
         type=int,
         default=1,
-        help="centralized의 라운드당 에폭 수 (기본값: 1) 또는 --num_updates <= 0일 때의 로컬 에폭 수",
+        help="--num_updates <= 0일 때 라운드당 로컬 에폭 수 (기본값: 1)",
     )
     parser.add_argument(
         "--batch_size",
@@ -142,7 +142,7 @@ def parse_args():
         type=str,
         default="constant",
         choices=list(LR_SCHEDULES),
-        help="라운드(Centralized는 에폭) 단위 학습률 스케줄. constant=FLamby 공식(기본), "
+        help="라운드 단위 학습률 스케줄. constant=FLamby 공식(기본), "
              "cosine=1라운드 --lr에서 시작해 코사인으로 감소",
     )
     parser.add_argument(
@@ -154,8 +154,8 @@ def parse_args():
     parser.add_argument(
         "--mu",
         type=float,
-        default=0.01,
-        help="FedProx 근접 항 계수 (method='fedprox'일 때 적용, fedavg/centralized는 0.0으로 강제)",
+        default=0.1,
+        help="FedProx 근접 항 계수 (0보다 커야 함. FedAvg는 지원하지 않음)",
     )
     parser.add_argument(
         "--save_dir",
@@ -215,7 +215,7 @@ def _atomic_torch_save(obj, path: str):
     os.replace(tmp_path, path)
 
 
-def _capture_rng_states(client_loaders, centralized_loader) -> dict:
+def _capture_rng_states(client_loaders) -> dict:
     return {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
@@ -224,15 +224,10 @@ def _capture_rng_states(client_loaders, centralized_loader) -> dict:
         "client_loader_generators": [
             l.generator.get_state() if l.generator is not None else None for l in client_loaders
         ],
-        "central_loader_generator": (
-            centralized_loader.generator.get_state()
-            if centralized_loader.generator is not None
-            else None
-        ),
     }
 
 
-def _restore_rng_states(states: dict, client_loaders, centralized_loader):
+def _restore_rng_states(states: dict, client_loaders):
     try:
         random.setstate(states["python"])
         np.random.set_state(states["numpy"])
@@ -243,9 +238,6 @@ def _restore_rng_states(states: dict, client_loaders, centralized_loader):
         for loader, g_state in zip(client_loaders, states.get("client_loader_generators", [])):
             if loader.generator is not None and g_state is not None:
                 loader.generator.set_state(g_state.cpu())
-        c_state = states.get("central_loader_generator")
-        if centralized_loader.generator is not None and c_state is not None:
-            centralized_loader.generator.set_state(c_state.cpu())
     except Exception as e:
         print(f"[Resume Warning] 난수 상태 일부 복원 생략 (GPU/환경 변경 가능성): {e}")
 
@@ -358,19 +350,16 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     # FLamby 공식 벤치마크 학습 스케줄 결정
-    if args.method == "centralized":
-        effective_num_updates = None
-        if args.rounds is None:
+    effective_num_updates = args.num_updates if args.num_updates > 0 else None
+    if args.rounds is None:
+        if effective_num_updates is not None:
+            args.rounds = get_nb_max_rounds(effective_num_updates, batch_size=args.batch_size)
+        else:
             args.rounds = NUM_EPOCHS_POOLED
-    else:
-        effective_num_updates = args.num_updates if args.num_updates > 0 else None
-        if args.rounds is None:
-            if effective_num_updates is not None:
-                args.rounds = get_nb_max_rounds(effective_num_updates, batch_size=args.batch_size)
-            else:
-                args.rounds = NUM_EPOCHS_POOLED
 
-    effective_mu = args.mu if args.method == "fedprox" else 0.0
+    if args.mu <= 0.0:
+        raise ValueError(f"FedProx는 --mu > 0 이어야 합니다 (현재 {args.mu}). FedAvg는 지원하지 않습니다.")
+    effective_mu = args.mu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] Using device: {device} | Seed: {args.seed}")
     schedule_desc = (
@@ -384,7 +373,7 @@ def main():
     )
 
     # 1. DataLoader 준비 (FLamby 공식 6개 센터: Center 0 ~ 5)
-    client_loaders, centralized_loader, val_loader, test_loader = get_dataloaders(
+    client_loaders, _unused_pooled_loader, val_loader, test_loader = get_dataloaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         data_path=args.data_path,
@@ -404,7 +393,7 @@ def main():
 
     print(f"[Info] Number of clients: {num_clients} | Client samples: {client_sample_counts}")
     print(
-        f"[Info] Centralized train samples: {len(centralized_loader.dataset)} | "
+        f"[Info] Total train samples: {sum(client_sample_counts)} | "
         f"Val samples: {len(val_loader.dataset)} | Test samples: {len(test_loader.dataset)} "
         f"(val_fraction={args.val_fraction}, split_seed={args.split_seed})"
     )
@@ -415,36 +404,22 @@ def main():
     # 3. 글로벌 모델(FLamby 공식 Baseline: EfficientNet-B0) 초기화 및 1라운드당 통신량(MB) 계산
     global_model = build_efficientnet_b0(num_classes=8, pretrained=True).to(device)
     model_size_mb = compute_model_size_mb(global_model)
-    round_comm_mb = (
-        0.0
-        if args.method == "centralized"
-        else compute_round_comm_mb(global_model, num_clients)
-    )
+    round_comm_mb = compute_round_comm_mb(global_model, num_clients)
     print(
         f"[Info] Model Size: {model_size_mb:.2f} MB | "
         f"Comm Volume per Round (Down+Up): {round_comm_mb:.2f} MB"
     )
 
     # FLamby 공식 구현(_Model 및 Optimizer = torch.optim.Adam)과 동일하게 옵티마이저를 루프 밖에서 1회 생성해 상태 유지:
-    # - Centralized: 단일 글로벌 모델에 대한 central_optimizer 유지
-    # - 연합학습(FedAvg/FedProx): 6개 클라이언트별 로컬 모델(client_models)과 로컬 옵티마이저(client_optimizers)를
+    # - FedProx: 6개 클라이언트별 로컬 모델(client_models)과 로컬 옵티마이저(client_optimizers)를
     #   루프 밖에서 1회 생성하고, 매 라운드 글로벌 가중치만 load_state_dict로 동기화하여 Adam 모멘텀 상태를 유지
-    if args.method == "centralized":
-        central_optimizer = Optimizer(global_model.parameters(), lr=args.lr)
-        client_models = None
-        client_optimizers = None
-    else:
-        central_optimizer = None
-        client_models = [copy.deepcopy(global_model) for _ in range(num_clients)]
-        client_optimizers = [
-            Optimizer(m.parameters(), lr=args.lr) for m in client_models
-        ]
+    client_models = [copy.deepcopy(global_model) for _ in range(num_clients)]
+    client_optimizers = [
+        Optimizer(m.parameters(), lr=args.lr) for m in client_models
+    ]
 
     # 4. 결과 기록용 CSV 및 모델 저장 경로 설정 (시드 및 FedProx mu 값 구분)
-    if args.method == "fedprox":
-        exp_tag = f"{args.method}_mu{effective_mu:g}"
-    else:
-        exp_tag = f"{args.method}"
+    exp_tag = f"{args.method}_mu{effective_mu:g}"
     if args.lr_schedule != "constant":
         # 기본(constant) 실험과 결과 파일이 섞이지 않도록 태그에 스케줄을 반영
         exp_tag += f"_{args.lr_schedule}"
@@ -493,19 +468,16 @@ def main():
 
         global_model.load_state_dict(ckpt["model_state_dict"])
         global_model.to(device)
-        if central_optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
-            central_optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if client_models is not None:
-            for c_model in client_models:
-                c_model.load_state_dict(global_model.state_dict())
-                c_model.to(device)
-            saved_client_opts = ckpt.get("client_optimizer_state_dicts")
-            if client_optimizers is not None and saved_client_opts is not None:
-                for c_opt, opt_state in zip(client_optimizers, saved_client_opts):
-                    c_opt.load_state_dict(opt_state)
+        for c_model in client_models:
+            c_model.load_state_dict(global_model.state_dict())
+            c_model.to(device)
+        saved_client_opts = ckpt.get("client_optimizer_state_dicts")
+        if saved_client_opts is not None:
+            for c_opt, opt_state in zip(client_optimizers, saved_client_opts):
+                c_opt.load_state_dict(opt_state)
         best_balanced_acc = ckpt["best_balanced_acc"]
         start_round = ckpt["round"] + 1
-        _restore_rng_states(ckpt["rng_states"], client_loaders, centralized_loader)
+        _restore_rng_states(ckpt["rng_states"], client_loaders)
         _truncate_csv(csv_path, ckpt["round"])
         print(
             f"[Resume] {last_ckpt_path} 로드 완료 → Round {start_round}부터 재개 "
@@ -529,66 +501,50 @@ def main():
         round_learning_rate = round_lr(
             args.lr, r, args.rounds, args.lr_schedule, args.lr_min_ratio
         )
-        for opt in ([central_optimizer] if central_optimizer is not None else client_optimizers):
+        for opt in client_optimizers:
             for group in opt.param_groups:
                 group["lr"] = round_learning_rate
 
-        if args.method == "centralized":
-            global_model, train_loss = train_one_client(
-                model=global_model,
-                dataloader=centralized_loader,
+        local_models = []
+        local_losses = []
+        divergences = []
+
+        for c_model, c_opt, step_iter in zip(
+            client_models, client_optimizers, client_step_iterators
+        ):
+            # FLamby _Model과 동일하게 로컬 모델 파라미터에 현재 글로벌 가중치를 인플레이스 동기화하되,
+            # 파라미터 텐서 인스턴스와 로컬 옵티마이저(Adam 모멘텀 상태)는 라운드 간 그대로 유지
+            c_model.load_state_dict(global_model.state_dict())
+            trained_local_model, c_loss = train_one_client(
+                model=c_model,
+                dataloader=step_iter,
                 criterion=criterion,
                 lr=args.lr,
                 local_epochs=args.local_epochs,
                 device=device,
-                mu=0.0,
-                global_model=None,
-                optimizer=central_optimizer,
-                num_updates=None,
-            )
-            # Centralized는 단일 글로벌 모델만 존재하므로 클라이언트 간 가중치 발산(Client Drift)은 0.0
-            avg_divergence = 0.0
-        else:
-            local_models = []
-            local_losses = []
-            divergences = []
-
-            for c_model, c_opt, step_iter in zip(
-                client_models, client_optimizers, client_step_iterators
-            ):
-                # FLamby _Model과 동일하게 로컬 모델 파라미터에 현재 글로벌 가중치를 인플레이스 동기화하되,
-                # 파라미터 텐서 인스턴스와 로컬 옵티마이저(Adam 모멘텀 상태)는 라운드 간 그대로 유지
-                c_model.load_state_dict(global_model.state_dict())
-                trained_local_model, c_loss = train_one_client(
-                    model=c_model,
-                    dataloader=step_iter,
-                    criterion=criterion,
-                    lr=args.lr,
-                    local_epochs=args.local_epochs,
-                    device=device,
-                    mu=effective_mu,
-                    global_model=global_model,
-                    optimizer=c_opt,
-                    num_updates=effective_num_updates,
-                )
-
-                div = compute_weight_divergence(global_model, trained_local_model)
-                local_models.append(trained_local_model)
-                local_losses.append(c_loss)
-                divergences.append(div)
-
-            # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(BaselineLoss 기준) 계산
-            total_samples = sum(client_sample_counts)
-            train_loss = sum(
-                l * n for l, n in zip(local_losses, client_sample_counts)
-            ) / max(total_samples, 1)
-            avg_divergence = sum(divergences) / max(len(divergences), 1)
-
-            global_model = server_aggregate(
+                mu=effective_mu,
                 global_model=global_model,
-                client_models=local_models,
-                client_sample_counts=client_sample_counts,
+                optimizer=c_opt,
+                num_updates=effective_num_updates,
             )
+
+            div = compute_weight_divergence(global_model, trained_local_model)
+            local_models.append(trained_local_model)
+            local_losses.append(c_loss)
+            divergences.append(div)
+
+        # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(BaselineLoss 기준) 계산
+        total_samples = sum(client_sample_counts)
+        train_loss = sum(
+            l * n for l, n in zip(local_losses, client_sample_counts)
+        ) / max(total_samples, 1)
+        avg_divergence = sum(divergences) / max(len(divergences), 1)
+
+        global_model = server_aggregate(
+            global_model=global_model,
+            client_models=local_models,
+            client_sample_counts=client_sample_counts,
+        )
 
         # 글로벌 검증셋 및 클라이언트별 검증셋 평가 (test는 학습 종료 후 --final_test로 1회만 평가)
         eval_metrics = evaluate_model(
@@ -693,15 +649,8 @@ def main():
                 "config": run_config,
                 "best_balanced_acc": best_balanced_acc,
                 "model_state_dict": global_model.state_dict(),
-                "optimizer_state_dict": (
-                    central_optimizer.state_dict() if central_optimizer is not None else None
-                ),
-                "client_optimizer_state_dicts": (
-                    [c_opt.state_dict() for c_opt in client_optimizers]
-                    if client_optimizers is not None
-                    else None
-                ),
-                "rng_states": _capture_rng_states(client_loaders, centralized_loader),
+                "client_optimizer_state_dicts": [c_opt.state_dict() for c_opt in client_optimizers],
+                "rng_states": _capture_rng_states(client_loaders),
             },
             last_ckpt_path,
         )
