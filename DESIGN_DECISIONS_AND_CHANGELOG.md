@@ -115,7 +115,7 @@
 
 ---
 
-## 7. 다각도 평가지표 체계 및 병원 간 공정성(Fairness) 정밀화 (`federated_core.py`, `main.py`, 노트북)
+## 7. 다각도 평가지표 체계 및 병원 간 공정성(Fairness) 정밀화 (`federated_core.py`, `main.py`)
 
 ### 📌 설계 내용
 1. **Macro-F1 이중 정의 (`macro_f1` 주 지표 / `macro_f1_fixed8` 보조 지표)**:
@@ -140,7 +140,7 @@
 
 ---
 
-## 8. 엔지니어링 최적화 및 런타임 안정화 내역 (`federated_core.py`, `main.py`, 노트북)
+## 8. 엔지니어링 최적화 및 런타임 안정화 내역 (`federated_core.py`, `main.py`)
 
 | 번호 | 대상 파일 | 구현 내용 | 엔지니어링 근거 |
 | :---: | :--- | :--- | :--- |
@@ -149,5 +149,4 @@
 | **8.3** | `federated_core.py` | **`BatchNorm2d` 단일 샘플 배치 방어** | 미니배치 크기가 1일 때(`images.size(0) == 1`) `BatchNorm2d` 분산 계산 에러(`ValueError`)가 발생하지 않도록 건너뛰되, `num_updates` 스텝 카운트는 차감하지 않아 정확한 업데이트 횟수 보장. |
 | **8.4** | `main.py` | **클라이언트별 `Optimizer` 모멘텀 상태 유지** | FLamby 공식 `_Model`과 동일하게 6개 클라이언트의 로컬 모델과 `Optimizer`(`Adam`)를 루프 밖에서 1회 생성해 라운드 간 모멘텀을 유지함. |
 | **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·6개 `client_optimizers`·난수 상태를 저장하며, `.tmp` 작성 후 `os.replace`로 원자적 교체를 수행함. |
-| **8.6** | `fed_isic2019_colab.ipynb` (구 3종 비교 노트북, FedProx 전용 코드와는 맞지 않음) | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
 | **8.7** | `lr_schedule.py`, `main.py` | **라운드별 cosine lr 감쇠 및 resume 일치 검사** | torch 없이 테스트 가능한 순수 파이썬 스케줄러로 분리(`tests/test_lr_schedule.py`). `lr_schedule`, `lr_min_ratio`, `rounds`가 체크포인트와 다르면 resume을 막아 스케줄이 몰래 바뀌는 것을 방지하고, CSV에 `lr` 열을 기록함. |

@@ -22,7 +22,6 @@
 | **`lr_schedule.py`** | 학습률 스케줄 | • `round_lr`: `constant`(기본) 또는 `cosine` 라운드별 학습률 계산. torch에 의존하지 않아 CPU 단위테스트 가능(`tests/test_lr_schedule.py`) |
 | **`scripts/run_fedprox_r18_cosine.sh`** | 실행 스크립트 | • FedProx(μ=0.1)를 18라운드 + cosine lr로 시드 42/100/2026에 대해 `--resume --final_test`로 순차 실행 |
 | **`main.py`** | 학습 실행기 (CLI) | • `parse_args` / `set_seed`: FLamby 공식 하이퍼파라미터 및 학습 스케줄(`--num_updates 100`, `get_nb_max_rounds`) 적용, 전체 난수 고정, **FedProx 전용**(`--mu > 0` 강제)<br>• FLamby `_Model`과 동일하게 6개 클라이언트 로컬 모델(`client_models`) 및 로컬 옵티마이저(`client_optimizers = [Optimizer(...)]`)를 루프 밖에서 1회 생성하여 라운드 간 `Adam` 모멘텀 상태 유지<br>• `lr_schedule.py`의 `round_lr`로 **라운드별 lr(constant/cosine)** 을 계산해 클라이언트 옵티마이저의 `param_group["lr"]`만 갱신(Adam 모멘텀 상태는 유지)<br>• 매 라운드 **Validation** 지표 실시간 CSV 로깅, 최고 Val 모델(`best_*.pt`) 및 세션 중단 복구용 체크포인트(`last_*.pt`, `--resume`, 클라이언트 옵티마이저 상태 포함) 원자적 저장<br>• `--final_test` (`_run_final_test`): 학습 종료 후 FLamby **Test 셋을 단 1회만** 평가(`*_final_test.json`, 예측 `*_final_test_preds.npz` 저장) |
-| **`fed_isic2019_colab.ipynb`** | 협업 실행 노트북 | • **주의: 이 노트북은 이전 3종(Centralized/FedAvg/FedProx) 비교 흐름이라 FedProx 전용 코드와 맞지 않습니다.** FedProx 실험은 아래 6.2의 CLI 또는 `scripts/run_fedprox_r18_cosine.sh`로 실행하세요(노트북은 별도 정리 예정). 데이터 전처리·FLamby 설치(Phase 0~1) 셀은 그대로 참고할 수 있습니다. |
 | **`DESIGN_DECISIONS_AND_CHANGELOG.md`** | 설계 문서 | • 아키텍처, 손실 함수, 공식 학습 스케줄, 클라이언트 옵티마이저 상태 유지, 평가 프로토콜 및 엔지니어링 최적화 내역과 학술적·기술적 근거 정리 |
 
 ---
@@ -140,7 +139,7 @@ bash scripts/run_fedprox_r18_cosine.sh ./isic_data
 
 ## 7. 실험 프로토콜 (FedProx 전용)
 
-1. **환경 준비**: FLamby 설치(`pip install -e ".[isic2019]"`)와 ISIC 전처리 데이터 준비는 기존 Colab 노트북의 Phase 0~1을 참고합니다.
+1. **환경 준비**: FLamby 설치(`pip install -e ".[isic2019]"`, `requirements.txt` 패키지 설치)와 ISIC 전처리 데이터 준비를 먼저 합니다. 이전 Colab 노트북(`fed_isic2019_colab.ipynb`)은 FedProx 전용 코드와 맞지 않아 이 브랜치에서 삭제했습니다.
 2. **실행**: `bash scripts/run_fedprox_r18_cosine.sh <data_path>`. 시드 `42, 100, 2026`을 순서대로 학습하고 종료 시 `--final_test`로 Test를 단 1회 평가합니다(`*_final_test.json`, `*_final_test_preds.npz`).
 3. **비교**: 비교 기준은 `main`의 FedProx(μ=0.1, 9라운드) test balanced acc 0.6561과 참고용 FedAvg 0.6768, Centralized 0.7293(3시드 평균)입니다. 라운드 증가와 cosine을 함께 바꾸므로, 요인을 나누려면 `LR_SCHEDULE=constant`로 18라운드만 추가 실행합니다.
 4. **μ**: 이전 재확인 실험에서 μ 0.1과 0.3은 구분되지 않았으므로 기본값은 0.1을 유지합니다.
