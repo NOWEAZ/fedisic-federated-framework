@@ -65,3 +65,19 @@ LR_SCHEDULE=constant bash scripts/run_fedprox_r18_cosine.sh <data_path>   # (선
 
 이 브랜치는 FedProx만 지원한다. `main.py`에서 Centralized/FedAvg 경로를 제거했고, `--mu`는 0보다 커야 한다
 (기본값 0.1). 비교용 Centralized/FedAvg 수치는 main의 기존 결과를 쓴다.
+
+## 6. 병원별 개인화 평가 (`personalize.py`, 재학습 없음)
+5절 결과에서 병원 4(balanced acc 0.46)와 병원 3(0.57)이 가장 낮다. 병원 4는 예측의 21%가 그 병원에 없는 클래스로
+가지만, 그 클래스를 막아도 0.558까지이고 MEL→NV 혼동(46%)은 남는다(예측 파일 분석, 보고서 5절 아래 참고).
+그래서 학습이 끝난 글로벌 모델(`last_*.pt`)을 병원별로 자기 학습 데이터로 조금 더 학습시켜 병원별로 평가한다.
+
+- 설정 후보: scope(`adabn` / `head` / `bn_head` / `all`; adabn은 학습 없이 BN 통계만 병원 이미지로 재계산) × loss(`global` / `local`) × steps(기본 50, 100, 200). 병원 6곳에 공통으로 하나만 고른다.
+- 선택 기준은 병원별 **검증셋** balanced acc의 병원 평균이다. test는 설정을 고른 뒤 raw / mask_only / personalized 세 가지에만 쓴다.
+- 병원이 아는 정보는 자기 학습 라벨 분포뿐이다. 추론 시 학습 라벨에 없는 클래스를 제거하고, `local` loss는 같은 분포로 가중치를 만든다.
+- 결과는 "글로벌 모델 하나"가 아니라 "병원별 모델" 평가이므로 기존 표와 **별도 행**으로 적는다.
+
+```bash
+bash scripts/run_personalize.sh <data_path> <ckpt_dir>   # ckpt_dir: 18R 학습 결과 폴더(last_*.pt), 시드 42/100/2026
+```
+출력: `<ckpt_dir>/fedprox_mu0.1_cosine_seed{S}_personalize.json`(+ `_personalize_preds.npz`). 결과 파일이 있으면 test를 다시 열지 않는다.
+CPU 단위 테스트는 `python -m unittest tests.test_personalize_utils`. `personalize.py` 자체는 GPU·FLamby 환경에서만 실행해 볼 수 있다(작성 시점 미실행).
