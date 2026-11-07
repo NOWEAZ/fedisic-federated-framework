@@ -1,6 +1,6 @@
 # 🛠️ 설계 의사결정 및 엔지니어링 내역서 (Design Decisions & Engineering Log)
 
-본 문서는 **FLamby Fed-ISIC2019 (6-Client, 8-Class) 의료 영상 연합학습 프로젝트**의 핵심 설계 의사결정(아키텍처, 손실 함수, 옵티마이저, 학습 스케줄, 평가 프로토콜, 평가지표)과 런타임 안정화·최적화 내역을 기술적·학술적 근거와 함께 정리한 문서입니다. 보고서 및 논문 작성 시 **실험 설계 근거(Experimental Setup & Justification)** 로 바로 활용할 수 있습니다.
+본 문서는 **FLamby Fed-ISIC2019 (6-Client, 8-Class) 의료 영상 연합학습(FedProx 전용) 프로젝트**의 핵심 설계 의사결정(아키텍처, 손실 함수, 옵티마이저, 학습 스케줄, 평가 프로토콜, 평가지표)과 런타임 안정화·최적화 내역을 기술적·학술적 근거와 함께 정리한 문서입니다. 보고서 및 논문 작성 시 **실험 설계 근거(Experimental Setup & Justification)** 로 바로 활용할 수 있습니다.
 
 ---
 
@@ -8,21 +8,21 @@
 
 | 구분 | 설계 항목 | 최종 채택 내용 | 핵심 기술적·학술적 근거 요약 |
 | :---: | :--- | :--- | :--- |
-| **1** | **클라이언트 구성 및 하이퍼파라미터** | **FLamby 공식 6-Client (`Center 0 ~ 5`)** 및 공식 상수(`BATCH_SIZE=64`, `LR=5e-4`, `NUM_EPOCHS_POOLED=20`) | 실제 6개 의료기관·장비의 자연 분할(Natural Cross-Silo Split)과 FLamby 원 논문 벤치마크(NeurIPS 2022) 규격을 그대로 준수하여 재현성 확보 |
+| **1** | **클라이언트 구성 및 하이퍼파라미터** | **FLamby 공식 6-Client (`Center 0 ~ 5`)** 및 공식 상수(`BATCH_SIZE=64`, `LR=5e-4`) | 실제 6개 의료기관·장비의 자연 분할(Natural Cross-Silo Split)과 FLamby 원 논문 벤치마크(NeurIPS 2022) 규격을 그대로 준수하여 재현성 확보 |
 | **2** | **모델 및 정규화 계층** | FLamby 공식 **`Baseline` (`EfficientNet-B0`, `BatchNorm2d` 유지)** | FLamby 공식 모델 아키텍처를 그대로 사용하고, `GroupNorm` 교체 시 발생하는 사전학습 가중치 분포 붕괴(Representation Collapse) 방지 |
 | **3** | **손실 함수 (Loss Function)** | FLamby 공식 **`BaselineLoss` (Weighted Focal Loss)** | 극심한 클래스 불균형과 어려운 샘플(Hard Examples)에 집중하며, 모든 클라이언트가 동일한 목적함수 정의를 공유하도록 통일 |
-| **4** | **학습 스케줄 및 옵티마이저** | 연합학습 **`num_updates=100` 스텝 (`9` 라운드)**, Centralized **`20` 에폭**, 클라이언트별 **`Optimizer`(`Adam`) 라운드 간 상태 유지** | 병원 간 최대 28배 샘플 수 격차 환경에서 라운드당 업데이트 횟수를 100 스텝으로 통일(`ClientStepIterator`)하고, FLamby `_Model`과 동일하게 클라이언트별 `Adam` 모멘텀 상태를 유지 |
+| **4** | **학습 스케줄 및 옵티마이저** | FedProx **`num_updates=100` 스텝**, 기본 `9` 라운드(이 브랜치 실험은 **`18` 라운드**), 라운드별 **cosine lr 감쇠(옵션)**, 클라이언트별 **`Optimizer`(`Adam`) 라운드 간 상태 유지** | 병원 간 최대 28배 샘플 수 격차 환경에서 라운드당 업데이트 횟수를 100 스텝으로 통일(`ClientStepIterator`)하고, FLamby `_Model`과 동일하게 클라이언트별 `Adam` 모멘텀 상태를 유지 |
 | **5** | **데이터 분할 및 평가 프로토콜** | 센터별 **층화 90/10 Train/Val 분할** 및 학습 종료 후 **`--final_test` 단 1회 평가** | 매 라운드 모니터링·모델 선택·$\mu$ 튜닝을 Validation으로만 수행하여 Test 데이터 누수(Test-set Snooping) 및 선택 편향(Selection Bias) 원천 차단 |
-| **6** | **다중 시드 실험 전략** | **2단계 시드 분리** (`seed=41` 탐색 $\rightarrow$ `seed=42, 100, 2026` 본실험) | 하이퍼파라미터($\mu$) 선택 시드와 최종 보고용 3시드를 완전히 분리하여 통계적 엄밀성(`Mean ± Std`) 확보 및 코랩 탐색 시간 절감 |
+| **6** | **다중 시드 실험 전략** | 본실험 시드 `42, 100, 2026` (과거 μ 탐색은 시드 `41`/`40` 사용) | 하이퍼파라미터($\mu$) 선택 시드와 최종 보고용 3시드를 완전히 분리하여 통계적 엄밀성(`Mean ± Std`) 확보 및 코랩 탐색 시간 절감 |
 | **7** | **다각도 평가지표 체계** | **`Balanced Acc`**, **`Macro-F1`**, 병원별 **`balanced_acc_client0~5` / `macro_f1_client0~5`**, 병원 간 **`macro_f1_std` / `bal_acc_std`** 및 **`Gap`**, **`15-bin ECE`**, **`Weight Divergence`**, **`Cumulative Comm (MB)`** | 불균형 분류 성능뿐만 아니라 초소형 병원 노이즈에 강건한 병원 간 공정성(Fairness: Std & Gap), 신뢰도 보정(Calibration), Client Drift, 통신 효율성을 종합 평가 |
-| **8** | **엔지니어링 최적화 및 안정화** | 단일 패스 추론, 클라이언트/글로벌 옵티마이저 상태 유지, 순수 손실 로깅, `BN` 크기 1 방어, `--resume` 원자적 체크포인트 | 평가 속도 2배 향상, FLamby 공식 동작 완벽 재현, 코랩 세션 중단 시 무손실 재개 및 GPU/CPU 디바이스 동기화 보장 |
+| **8** | **엔지니어링 최적화 및 안정화** | 단일 패스 추론, 클라이언트 옵티마이저 상태 유지, 순수 손실 로깅, `BN` 크기 1 방어, `--resume` 원자적 체크포인트 | 평가 속도 2배 향상, FLamby 공식 동작 완벽 재현, 코랩 세션 중단 시 무손실 재개 및 GPU/CPU 디바이스 동기화 보장 |
 
 ---
 
 ## 1. 클라이언트 구성 및 공식 벤치마크 규격 채택 (`data_utils.py`, `main.py`)
 
 ### 📌 설계 내용
-- `flamby.datasets.fed_isic2019`가 제공하는 **공식 6개 병원/센터(`Center 0 ~ 5`, `NUM_CLIENTS = 6`)** 자연 분할과 공식 하이퍼파라미터 상수(`BATCH_SIZE = 64`, `LR = 5e-4`, `NUM_EPOCHS_POOLED = 20`)를 코드에서 직접 임포트하여 적용함.
+- `flamby.datasets.fed_isic2019`가 제공하는 **공식 6개 병원/센터(`Center 0 ~ 5`, `NUM_CLIENTS = 6`)** 자연 분할과 공식 하이퍼파라미터 상수(`BATCH_SIZE = 64`, `LR = 5e-4`)를 코드에서 직접 임포트하여 적용함.
 
 ### 💡 기술적·학술적 근거
 1. **현실적인 의료 Non-IID 환경 반영**:
@@ -49,9 +49,9 @@
 ## 3. 손실 함수: FLamby 공식 `BaselineLoss` (Weighted Focal Loss) 적용 (`federated_core.py`)
 
 ### 📌 설계 내용
-- `flamby.datasets.fed_isic2019.BaselineLoss` (Weighted Focal Loss)를 모든 학습(`Centralized`, `FedAvg`, `FedProx`) 및 평가(`Val`, `Test`)의 기본 분류 손실 함수로 사용함:
+- `flamby.datasets.fed_isic2019.BaselineLoss` (Weighted Focal Loss)를 모든 학습(`FedProx`) 및 평가(`Val`, `Test`)의 기본 분류 손실 함수로 사용함:
   $$\mathcal{L}_{\text{Focal}}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \log(p_t)$$
-- `FedProx`($\mu > 0$) 학습 시에는 역전파 목적함수에만 근접 정규화 항 $\frac{\mu}{2}\|w - w_{\text{global}}^{(t)}\|_2^2$을 더하고, CSV에 기록하는 `train_loss`에는 근접 항을 제외한 순수 $\mathcal{L}_{\text{Focal}}$만 누적하여 `FedAvg`와 동일 스케일에서 비교할 수 있게 함.
+- `FedProx`($\mu > 0$) 학습 시에는 역전파 목적함수에만 근접 정규화 항 $\frac{\mu}{2}\|w - w_{\text{global}}^{(t)}\|_2^2$을 더하고, CSV에 기록하는 `train_loss`에는 근접 항을 제외한 순수 $\mathcal{L}_{\text{Focal}}$만 누적하여 μ가 다른 실험 사이에서도 같은 스케일로 비교할 수 있게 함.
 
 ### 💡 기술적·학술적 근거
 1. **클래스 불균형 및 어려운 샘플(Hard Examples) 집중 학습**:
@@ -64,13 +64,15 @@
 ## 4. 학습 스케줄 및 옵티마이저: 공식 `num_updates = 100`, `ClientStepIterator`, 클라이언트별 `Optimizer` 상태 유지 (`federated_core.py`, `main.py`)
 
 ### 📌 설계 내용
-- **연합학습 (`FedAvg`, `FedProx`)**:
+- **연합학습 (`FedProx`)**:
   - 각 클라이언트가 매 통신 라운드마다 에폭 단위가 아닌 **고정 미니배치 업데이트 횟수 `num_updates = 100` 스텝**을 수행함.
-  - 총 통신 라운드 수는 FLamby 공식 함수인 `get_nb_max_rounds(num_updates=100, batch_size=64)`를 통해 **`9` 라운드**(클라이언트당 총 900 스텝)로 설정됨.
+  - 기본 통신 라운드 수는 FLamby 공식 함수인 `get_nb_max_rounds(num_updates=100, batch_size=64)`로 **`9` 라운드**(클라이언트당 총 900 스텝)이며, 이 브랜치의 실험은 `--rounds 18`로 늘려 실행함(학습 예산 증가).
   - 라운드 간 DataLoader 반복자(iterator) 상태를 유지하는 **`ClientStepIterator`** (FLamby `DataLoaderWithMemory` 동등 구현)를 적용함.
   - FLamby 전략 래퍼(`flamby/strategies/utils.py`의 `_Model`)와 동일하게 학습 시작 전 6개 클라이언트의 로컬 모델(`client_models`)과 공식 옵티마이저(`client_optimizers = [Optimizer(m.parameters(), lr=args.lr) for m in client_models]`, `Optimizer = torch.optim.Adam`)를 **단 1회 생성**하고, 매 라운드 `client_models[k].load_state_dict(global_model.state_dict())`로 가중치만 인플레이스 동기화하여 **라운드 간 클라이언트별 `Adam` 1·2차 모멘텀(`exp_avg`, `exp_avg_sq`, `step`) 상태를 그대로 유지**함.
-- **중앙집중 학습 (`Centralized`)**:
-  - FLamby 공식 Pooled 설정에 따라 라운드당 `1` 에폭씩 **`NUM_EPOCHS_POOLED = 20` 에폭**을 수행하며, `central_optimizer`의 `Adam` 상태를 에폭 간 유지함.
+- **라운드별 학습률 스케줄 (`lr_schedule.py`, `--lr_schedule`)**:
+  - 기본 `constant`(lr 5e-4 고정)이며 `cosine`을 선택하면 라운드 $r$의 lr이 $lr_{min} + 0.5(lr - lr_{min})(1+\cos(\pi (r-1)/R))$로 감쇠함(18라운드: 5e-4 → 약 3.8e-6). `Adam`의 모멘텀 상태는 유지하고 `param_group["lr"]`만 매 라운드 갱신함.
+  - 총 라운드 수 $R$에 의존하므로 `--resume` 시 `rounds`와 `lr_schedule`이 체크포인트와 같아야 함.
+- **Centralized/FedAvg 제거**: 이 브랜치는 FedProx 성능 개선에 집중하므로 두 학습 경로를 코드에서 제거함(`--mu > 0` 강제). 비교 수치는 `main`(8af4275)의 기존 결과를 참고용으로만 인용함.
 
 ### 💡 기술적·학술적 근거
 1. **병원 간 로컬 업데이트 스텝 수 균등화**:
@@ -101,13 +103,11 @@
 
 ---
 
-## 6. 다중 시드 실험 전략: 2단계 시드 분리 (`seed=41` 탐색 $\rightarrow$ `42, 100, 2026` 본실험) (`fed_isic2019_colab.ipynb`)
+## 6. 다중 시드 실험 전략: 탐색 시드와 본실험 시드 분리 (`42, 100, 2026`)
 
 ### 📌 설계 내용
-- **Stage 1 (Phase 3 — 탐색 전용 `EXPLORE_SEED = 41`)**:
-  - `FedAvg`($\mu=0$ 기준선)와 `FedProx` 후보군($\mu \in \{0.001, 0.01, 0.1, 1.0\}$)을 `seed=41`로 1회씩 실행하고, 단일 라운드 노이즈를 줄이기 위해 **Validation 마지막 3라운드(`LAST_K = 3`) 평균 지표**를 비교하여 사용자가 최적 `BEST_MU`를 선정함. 이 시드의 결과는 최종 요약표에서 제외함.
-- **Stage 2 (Phase 4 — 본실험 3시드 `FINAL_SEEDS = [42, 100, 2026]`)**:
-  - 확정된 3가지 기법(`Centralized`, `FedAvg`, `FedProx(BEST_MU)`)을 독립된 본실험 3개 시드로 실행하고 `--final_test`로 최종 Test `Mean ± Std` 요약표를 생성함.
+- **μ 선택**: 과거 탐색(시드 41, Validation 마지막 3라운드 평균)에서 μ=0.1을 골랐고, 이후 시드 40/41 재확인에서 μ=0.1과 0.3의 차이는 노이즈 수준(균형정확도 차이 ±0.003)이어서 **μ=0.1을 유지**함. 단일 시드 선택은 편향 위험이 있으므로 μ를 바꿀 때는 여러 시드로 다시 확인해야 함.
+- **본실험 시드 `42, 100, 2026`**: 선택에 쓴 시드와 분리해 `--final_test`로 Test를 단 1회 평가하고 `Mean ± Std`를 보고함.
 
 ### 💡 기술적·학술적 근거
 1. **하이퍼파라미터 선택 편향 배제 및 코랩 GPU 시간 절약**:
@@ -147,6 +147,7 @@
 | **8.1** | `federated_core.py` | **`evaluate_model` 단일 패스 추론** | 6개 클라이언트별 평가 로더(`client_eval_loaders`)의 추론 결과를 `np.concatenate`하여 Global 지표와 병원별 공정성 지표(`F1` 및 `Bal Acc`의 `Std`/`Gap`)를 한 번의 순회로 동시 산출(평가 시간 50% 단축). |
 | **8.2** | `federated_core.py` | **`BaselineLoss` 재귀적 디바이스 동기화 (`_sync_criterion_device`)** | FLamby `BaselineLoss` 내부에 PyTorch 버퍼로 등록되지 않은 일반 텐서 속성(`self.alpha` 등)을 재귀적으로 탐색해 `CPU`/`CUDA` 디바이스로 이동시켜 런타임 디바이스 불일치 에러 원천 차단. |
 | **8.3** | `federated_core.py` | **`BatchNorm2d` 단일 샘플 배치 방어** | 미니배치 크기가 1일 때(`images.size(0) == 1`) `BatchNorm2d` 분산 계산 에러(`ValueError`)가 발생하지 않도록 건너뛰되, `num_updates` 스텝 카운트는 차감하지 않아 정확한 업데이트 횟수 보장. |
-| **8.4** | `main.py` | **클라이언트별 `Optimizer` 및 `Centralized` 옵티마이저 모멘텀 상태 유지** | FLamby 공식 `_Model`과 동일하게 연합학습에서는 6개 클라이언트의 로컬 모델과 `Optimizer`(`Adam`)를 루프 밖에서 1회 생성해 라운드 간 모멘텀을 유지하고, `Centralized`는 `central_optimizer`로 에폭 간 모멘텀을 유지함. |
-| **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·옵티마이저(`central_optimizer` 및 6개 `client_optimizers`)·난수 상태를 저장하며, `.tmp` 작성 후 `os.replace`로 원자적 교체를 수행함. |
-| **8.6** | `fed_isic2019_colab.ipynb` | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
+| **8.4** | `main.py` | **클라이언트별 `Optimizer` 모멘텀 상태 유지** | FLamby 공식 `_Model`과 동일하게 6개 클라이언트의 로컬 모델과 `Optimizer`(`Adam`)를 루프 밖에서 1회 생성해 라운드 간 모멘텀을 유지함. |
+| **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·6개 `client_optimizers`·난수 상태를 저장하며, `.tmp` 작성 후 `os.replace`로 원자적 교체를 수행함. |
+| **8.6** | `fed_isic2019_colab.ipynb` (구 3종 비교 노트북, FedProx 전용 코드와는 맞지 않음) | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
+| **8.7** | `lr_schedule.py`, `main.py` | **라운드별 cosine lr 감쇠 및 resume 일치 검사** | torch 없이 테스트 가능한 순수 파이썬 스케줄러로 분리(`tests/test_lr_schedule.py`). `lr_schedule`, `lr_min_ratio`, `rounds`가 체크포인트와 다르면 resume을 막아 스케줄이 몰래 바뀌는 것을 방지하고, CSV에 `lr` 열을 기록함. |

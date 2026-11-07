@@ -4,12 +4,12 @@
 
 ## 1. 베이스라인 (main이 하는 일)
 - FLamby Fed-ISIC2019 공식 6센터, EfficientNet-B0(BN 유지), 가중 Focal Loss(전역 alpha)
-- FedAvg/FedProx: 라운드당 클라이언트 100스텝 × 9라운드, Adam lr 5e-4 고정, 배치 64, **클라이언트 Adam 상태 라운드 간 유지**
+- FedProx(main에서는 FedAvg도 지원했으나 이 브랜치에서는 제거): 라운드당 클라이언트 100스텝 × 9라운드, Adam lr 5e-4 고정, 배치 64, **클라이언트 Adam 상태 라운드 간 유지**
 - 서버: 샘플 수 비례 가중 평균 (Center 0이 약 53%)
-- Centralized: 20에폭. 검증 90/10 층화 분할, 테스트는 `--final_test`로 1회
+- 검증 90/10 층화 분할, 테스트는 `--final_test`로 1회 (Centralized 학습은 main에만 있었고 이 브랜치에서는 제거)
 - 시드: 탐색 41, 본실험 42/100/2026
 
-**main의 결과 (8af4275, `results/`, 시드 42/100/2026 test 1회 평가, 9라운드)**
+**main의 결과 (8af4275, 시드 42/100/2026 test 1회 평가, 9라운드; 결과 파일은 이 브랜치에서 삭제하고 수치만 인용)**
 
 | 방법 | balanced acc | macro-F1 | 병원 간 bal-acc std | ECE |
 |---|---|---|---|---|
@@ -38,17 +38,17 @@ FedProx는 전체 balanced acc가 FedAvg보다 낮고(−2.1%p), 병원 간 편�
 ## 3. 1순위 구현: `--lr_schedule cosine`
 - `--lr_schedule {constant,cosine}` (기본 constant = main과 동일), `--lr_min_ratio` (기본 0)
 - 라운드 r의 lr = lr_min + 0.5·(lr − lr_min)·(1 + cos(π·(r−1)/R)). 1라운드 = 5e-4, 마지막 라운드 ≈ 3%.
-- Adam 모멘텀은 그대로 두고 `param_group["lr"]`만 매 라운드 갱신. Centralized는 에폭 단위로 동일 적용.
+- Adam 모멘텀은 그대로 두고 `param_group["lr"]`만 매 라운드 갱신. (Centralized 경로는 제거됨)
 - cosine이면 결과 파일 태그에 `_cosine`이 붙어 베이스라인과 섞이지 않음. CSV에 `lr` 열 추가.
 - resume: 구 체크포인트(키 없음)는 constant로 간주. 스케줄이 다르면 오류.
 
 ## 4. 검증 실험 (GPU 필요, 아직 미실행)
 같은 시드(42, 100, 2026)·9라운드로 두 번만 실행하고 test balanced acc를 비교한다.
 ```bash
-python main.py --method fedavg --seed 42 --data_path ./isic_data --save_dir ./results/base   --resume --final_test
-python main.py --method fedavg --seed 42 --lr_schedule cosine --data_path ./isic_data --save_dir ./results/cosine --resume --final_test
+python main.py --method fedprox --mu 0.1 --seed 42 --data_path ./isic_data --save_dir ./results_fedprox_r9 --resume --final_test
+python main.py --method fedprox --mu 0.1 --rounds 18 --lr_schedule cosine --seed 42 --data_path ./isic_data --save_dir ./results_fedprox_r18_cosine --resume --final_test
 ```
-FedProx는 베이스라인 FedAvg 결과로 효과가 확인된 뒤에 같은 방식으로 추가한다.
+비교 기준은 main의 FedProx 9라운드 결과(0.6561)이다.
 
 ## 5. FedProx 18라운드 + cosine 실험 (이 브랜치 `perf/fedprox-r18-cosine`)
 FedProx를 연합 알고리즘으로 확정하고, FedProx만 아래 두 요인을 함께 바꿔 3시드로 실행한다.
