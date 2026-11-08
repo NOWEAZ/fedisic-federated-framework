@@ -76,9 +76,6 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--val_fraction", type=float, default=0.1)
     p.add_argument("--split_seed", type=int, default=0)
-    p.add_argument("--force_config", type=str, default=None,
-                   help="검증 탐색 없이 이 설정(scope,loss,steps)만 test에서 평가. 예: adabn,global,50. "
-                        "결과는 *_personalize_forced_<scope>_<loss>_<steps>.json 에 따로 저장")
     return p.parse_args()
 
 
@@ -263,57 +260,13 @@ def summarize(per_client_true, per_client_prob, present):
     return out, preds
 
 
-def _run_forced(forced, args, global_model, client_loaders, test_loaders, ctx, present, criterion,
-                device, ckpt, out_json, out_npz):
-    """검증 탐색 없이 지정한 설정 하나만 test에서 평가한다 (raw는 비교용)."""
-    scope, loss_kind, st = forced
-    raw_true, raw_prob, f_true, f_prob = [], [], [], []
-    for k in range(NUM_CLIENTS):
-        probs, y_true = predict(global_model, test_loaders[k], device, criterion)
-        raw_true.append(y_true)
-        raw_prob.append(probs)
-        model_k, _ = finetune_client(global_model, client_loaders[k], scope, loss_kind, [st], ctx, k)
-        probs, y_true = predict(model_k, test_loaders[k], device, criterion)
-        f_true.append(y_true)
-        f_prob.append(probs)
-        del model_k
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-    all_present = [np.ones(8, dtype=bool) for _ in range(NUM_CLIENTS)]
-    raw_metrics, _ = summarize(raw_true, raw_prob, all_present)
-    mask_metrics, _ = summarize(raw_true, raw_prob, present)
-    forced_metrics, forced_preds = summarize(f_true, f_prob, present)
-    for name, m in (("raw", raw_metrics), ("mask_only", mask_metrics), (f"{scope}", forced_metrics)):
-        print(f"[Test] {name:10s} 병원별 {np.round(m['client_balanced_acc'], 4).tolist()} | "
-              f"최저 {m['min_bal_acc']:.4f} 평균 {m['mean_client_bal_acc']:.4f} 표준편차 {m['bal_acc_std']:.4f} | "
-              f"전체 bal acc {m['balanced_acc']:.4f} macro-F1 {m['macro_f1']:.4f} ECE {m['ece']:.4f}")
-    result = {
-        "seed": args.seed, "tag": args.tag, "checkpoint_round": ckpt.get("round"),
-        "forced_config": {"scope": scope, "loss": loss_kind, "steps": st, "lr": args.lr, "mu": args.mu},
-        "test": {"raw": raw_metrics, "mask_only": mask_metrics, "forced": forced_metrics},
-        "note": "지정 설정 1개를 test에서 평가한 보조 결과. 설정 선택에는 쓰지 않았다.",
-    }
-    np.savez_compressed(out_npz, **forced_preds)
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"[Done] {out_json}")
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
     save_dir = args.save_dir or args.ckpt_dir
     os.makedirs(save_dir, exist_ok=True)
-    forced = None
-    suffix = "personalize"
-    if args.force_config:
-        f_scope, f_loss, f_steps = args.force_config.split(",")
-        forced = (f_scope, f_loss, int(f_steps))
-        if f_scope not in SCOPES or f_loss not in LOSS_KINDS:
-            raise ValueError(f"알 수 없는 force_config: {args.force_config}")
-        suffix = f"personalize_forced_{f_scope}_{f_loss}_{f_steps}"
-    out_json = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_{suffix}.json")
-    out_npz = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_{suffix}_preds.npz")
+    out_json = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_personalize.json")
+    out_npz = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_personalize_preds.npz")
     if os.path.exists(out_json):
         print(f"[Personalize] 이미 결과가 있어 test를 다시 평가하지 않습니다: {out_json}")
         return
@@ -366,11 +319,6 @@ def main():
         "present": present,
         "alpha": alpha,
     }
-
-    if forced is not None:
-        _run_forced(forced, args, global_model, client_loaders, test_loaders, ctx, present, criterion,
-                    device, ckpt, out_json, out_npz)
-        return
 
     # 1) 검증셋에서 설정 탐색 (test는 열지 않는다)
     val_scores = {}
