@@ -82,3 +82,21 @@ def select_config(val_scores: dict):
 
     best_key, best_scores = sorted(val_scores.items(), key=key)[0]
     return best_key, float(np.mean(best_scores))
+
+
+def select_config_sweep(val_scores: dict):
+    """
+    val_scores: {(scope, loss, steps, mu, lr): [병원별 val balanced acc 6개]}.
+    병원 평균 val balanced acc가 가장 높은 설정을 고른다. 동률이면 스텝이 적고, 범위가 작고, 근접 항이 크고(mu↑),
+    learning rate가 작은 쪽을 택한다. 병원마다 따로 고르지 않고 모든 병원에 공통 설정 하나를 쓴다.
+    """
+    if not val_scores:
+        raise ValueError("val_scores가 비어 있습니다.")
+
+    def key(item):
+        (scope, loss, steps, mu, lr), scores = item
+        mean = float(np.mean(scores))
+        return (-round(mean, 6), steps, SCOPES.index(scope), LOSS_KINDS.index(loss), -float(mu), float(lr))
+
+    best_key, best_scores = sorted(val_scores.items(), key=key)[0]
+    return best_key, float(np.mean(best_scores))

@@ -47,6 +47,7 @@ from personalize_utils import (
     mask_probs,
     present_mask,
     select_config,
+    select_config_sweep,
 )
 
 
@@ -76,6 +77,10 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--val_fraction", type=float, default=0.1)
     p.add_argument("--split_seed", type=int, default=0)
+    p.add_argument("--mus", type=str, default=None,
+                   help="근접 항 계수 후보(쉼표 구분). --mus 또는 --lrs를 주면 (mu, lr) 조합을 모두 훑는 sweep 모드. "
+                        "결과는 *_personalize_sweep.json 에 따로 저장")
+    p.add_argument("--lrs", type=str, default=None, help="미세조정 learning rate 후보(쉼표 구분). sweep 모드")
     return p.parse_args()
 
 
@@ -265,8 +270,10 @@ def main():
     set_seed(args.seed)
     save_dir = args.save_dir or args.ckpt_dir
     os.makedirs(save_dir, exist_ok=True)
-    out_json = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_personalize.json")
-    out_npz = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_personalize_preds.npz")
+    sweep = args.mus is not None or args.lrs is not None
+    suffix = "personalize_sweep" if sweep else "personalize"
+    out_json = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_{suffix}.json")
+    out_npz = os.path.join(save_dir, f"{args.tag}_seed{args.seed}_{suffix}_preds.npz")
     if os.path.exists(out_json):
         print(f"[Personalize] 이미 결과가 있어 test를 다시 평가하지 않습니다: {out_json}")
         return
@@ -329,25 +336,37 @@ def main():
     print(f"[Val] 글로벌 모델(제거 적용) 병원별 balanced acc: {np.round(base_val, 4).tolist()} "
           f"평균 {np.mean(base_val):.4f}")
 
-    for scope in scopes:
-        for loss_kind in losses:
-            if scope == "adabn" and loss_kind != losses[0]:
-                continue  # AdaBN은 손실을 쓰지 않으므로 한 번만 실행
-            per_client = []
-            for k in range(NUM_CLIENTS):
-                _, sc = finetune_client(
-                    global_model, client_loaders[k], scope, loss_kind, steps, ctx, k, val_loader=val_loaders[k]
-                )
-                per_client.append(sc)
-            for st in steps:
-                val_scores[(scope, loss_kind, st)] = [per_client[k][st] for k in range(NUM_CLIENTS)]
-                print(f"[Val] {scope:8s} {loss_kind:6s} steps={st:4d} → 병원별 "
-                      f"{np.round(val_scores[(scope, loss_kind, st)], 4).tolist()} "
-                      f"평균 {np.mean(val_scores[(scope, loss_kind, st)]):.4f}")
+    mus = [float(x) for x in args.mus.split(",")] if args.mus else [args.mu]
+    lrs = [float(x) for x in args.lrs.split(",")] if args.lrs else [args.lr]
+    combos = [(m, l) for m in mus for l in lrs]
+    for mu_c, lr_c in combos:
+        ctx_c = dict(ctx, mu=mu_c, lr=lr_c)
+        for scope in scopes:
+            for loss_kind in losses:
+                if scope == "adabn" and loss_kind != losses[0]:
+                    continue  # AdaBN은 손실을 쓰지 않으므로 한 번만 실행
+                if scope == "adabn" and (mu_c, lr_c) != combos[0]:
+                    continue  # AdaBN은 mu, lr과 무관
+                per_client = []
+                for k in range(NUM_CLIENTS):
+                    _, sc = finetune_client(
+                        global_model, client_loaders[k], scope, loss_kind, steps, ctx_c, k, val_loader=val_loaders[k]
+                    )
+                    per_client.append(sc)
+                for st in steps:
+                    key = (scope, loss_kind, st, mu_c, lr_c) if sweep else (scope, loss_kind, st)
+                    val_scores[key] = [per_client[k][st] for k in range(NUM_CLIENTS)]
+                    print(f"[Val] {scope:8s} {loss_kind:6s} steps={st:4d} mu={mu_c:g} lr={lr_c:g} → 병원별 "
+                          f"{np.round(val_scores[key], 4).tolist()} 평균 {np.mean(val_scores[key]):.4f}")
 
-    (best_scope, best_loss, best_steps), best_val_mean = select_config(val_scores)
-    print(f"[Select] val 평균 최고 설정: scope={best_scope}, loss={best_loss}, steps={best_steps} "
-          f"(val 평균 {best_val_mean:.4f}; 글로벌 모델 {np.mean(base_val):.4f})")
+    if sweep:
+        (best_scope, best_loss, best_steps, best_mu, best_lr), best_val_mean = select_config_sweep(val_scores)
+        ctx = dict(ctx, mu=best_mu, lr=best_lr)
+    else:
+        (best_scope, best_loss, best_steps), best_val_mean = select_config(val_scores)
+        best_mu, best_lr = args.mu, args.lr
+    print(f"[Select] val 평균 최고 설정: scope={best_scope}, loss={best_loss}, steps={best_steps}, "
+          f"mu={best_mu:g}, lr={best_lr:g} (val 평균 {best_val_mean:.4f}; 글로벌 모델 {np.mean(base_val):.4f})")
 
     # 2) test 평가: raw / mask_only / personalized 각 1회
     raw_true, raw_prob = [], []
@@ -387,10 +406,12 @@ def main():
         "seed": args.seed,
         "tag": args.tag,
         "checkpoint_round": ckpt.get("round"),
-        "finetune": {"lr": args.lr, "mu": args.mu, "steps_grid": steps, "scopes": scopes, "losses": losses},
-        "selected": {"scope": best_scope, "loss": best_loss, "steps": best_steps, "val_mean": best_val_mean},
+        "finetune": {"lr": args.lr, "mu": args.mu, "steps_grid": steps, "scopes": scopes, "losses": losses,
+                     "mus": mus, "lrs": lrs, "sweep": sweep},
+        "selected": {"scope": best_scope, "loss": best_loss, "steps": best_steps, "mu": best_mu, "lr": best_lr,
+                     "val_mean": best_val_mean},
         "val_global_model_masked": base_val,
-        "val_grid": {f"{s}|{l}|{st}": v for (s, l, st), v in val_scores.items()},
+        "val_grid": {"|".join(str(x) for x in key): v for key, v in val_scores.items()},
         "train_label_counts": [c.tolist() for c in counts],
         "test": {"raw": raw_metrics, "mask_only": mask_metrics, "personalized": pers_metrics},
         "note": "병원별 모델 평가. 글로벌 모델 결과와 별도 설정으로 보고할 것.",
