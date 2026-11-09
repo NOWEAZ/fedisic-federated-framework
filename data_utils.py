@@ -51,6 +51,23 @@ def _extract_labels_from_dataset(dataset: Dataset) -> np.ndarray:
     return np.asarray(labels, dtype=np.int64)
 
 
+def get_client_class_counts(client_loaders: list[DataLoader], num_classes: int = 8) -> np.ndarray:
+    """
+    각 클라이언트 학습 DataLoader에서 클래스별(0 ~ num_classes-1) 샘플 수 행렬을 추출합니다.
+    이미지 디코딩 없이 메타데이터에서 즉시 추출하며, CA-FedProx의 병원별 적응형 mu_k 및
+    결측 클래스 인지 분류기 집계(Class-Aware Classifier Aggregation)에 사용됩니다.
+
+    Returns:
+        np.ndarray: shape (num_clients, num_classes)의 정수형 샘플 수 행렬 (n_{k,c})
+    """
+    counts = np.zeros((len(client_loaders), num_classes), dtype=np.int64)
+    for k, loader in enumerate(client_loaders):
+        labels = _extract_labels_from_dataset(loader.dataset)
+        for c in range(num_classes):
+            counts[k, c] = int(np.sum(labels == c))
+    return counts
+
+
 def stratified_train_val_split(
     labels,
     val_fraction: float = 0.1,

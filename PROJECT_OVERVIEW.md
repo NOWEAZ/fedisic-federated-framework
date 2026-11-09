@@ -1,7 +1,7 @@
 # 🏥 Fed-ISIC2019 의료 영상 연합학습 프로젝트 개요 (Project Overview)
 
 ## 1. 프로젝트 목적
-본 프로젝트는 다기관 피부병변 분류 벤치마크인 **FLamby Fed-ISIC2019 (6-Client, 8-Class)** 공식 환경에서 발생하는 **병원 간 비독립·비동등 분포(Non-IID: Quantity Skew, Feature Shift, Label Imbalance)** 문제를 분석하고, 표준 연합학습인 **FedAvg**와 근접 정규화 기반 **FedProx**, 그리고 상한 기준선인 **Centralized** 학습을 다각도로 비교·검증하기 위해 설계되었습니다.
+본 프로젝트는 다기관 피부병변 분류 벤치마크인 **FLamby Fed-ISIC2019 (6-Client, 8-Class)** 공식 환경에서 발생하는 **병원 간 비독립·비동등 분포(Non-IID: Quantity Skew, Feature Shift, Label Imbalance & Missing Classes)** 문제를 분석하고, 상한 기준선인 **Centralized**, 표준 연합학습인 **FedAvg**, 근접 정규화 기반 **FedProx**, 그리고 본 연구에서 제안하는 **CA-FedProx (Class- & Client-Aware FedProx with Warm-Floor Cosine LR Decay)** 의 4가지 학습 기법을 다각도로 비교·검증하기 위해 설계되었습니다.
 
 단순 분류 정확도 비교에 그치지 않고, 실제 의료 AI 임상 적용에서 필수적인 다음 5가지 축을 종합 평가합니다:
 1. **불균형 분류 성능**: `Balanced Accuracy`, `Macro F1-Score` (존재 클래스 기준 주 지표 / 8클래스 고정 보조 지표)
@@ -17,8 +17,8 @@
 | 파일명 | 구분 | 주요 클래스·함수 및 역할 |
 | :--- | :---: | :--- |
 | **`requirements.txt`** | 환경 설정 | 필수 패키지 명세 (`torch`, `torchvision`, `scikit-learn`, `pandas`, `matplotlib`, `tqdm`, `albumentations==1.3.1`) |
-| **`data_utils.py`** | 데이터 파이프라인 | • `get_dataloaders`: FLamby 공식 6개 센터(`Center 0 ~ 5`, `NUM_CLIENTS = 6`) 학습 로더, Centralized 통합 로더, **Validation(Global/클라이언트별)** 로더, **Test(Global/클라이언트별)** 로더 생성<br>• `stratified_train_val_split` / `_build_center_datasets`: 센터별 FLamby train을 클래스 비율을 보존하며 **90% 학습 / 10% 검증** `Subset`으로 분할 (검증셋은 학습용 무작위 증강 없이 공식 test와 동일한 결정론적 변환 적용)<br>• FLamby 공식 클래스·상수·함수(`Baseline`, `BaselineLoss`, `Optimizer`, `BATCH_SIZE=64`, `LR=5e-4`, `NUM_CLIENTS=6`, `NUM_EPOCHS_POOLED=20`, `get_nb_max_rounds`) 임포트 및 제공<br>• `_seed_worker`: 멀티프로세싱 DataLoader 워커 난수 시드 고정 |
-| **`federated_core.py`** | 모델 및 연합학습 코어 | • `ClientStepIterator`: FLamby `DataLoaderWithMemory`와 동일하게 라운드 간 반복자(iterator) 상태를 유지하며 정확히 `num_updates` 스텝의 미니배치를 연속 공급<br>• `build_efficientnet_b0`: FLamby 공식 `Baseline` 모델(`EfficientNet-B0` 사전학습, `BatchNorm2d` 유지, 8클래스 분류기) 우선 생성 (`torchvision` 호환 fallback 포함)<br>• `build_baseline_loss` / `_sync_criterion_device`: FLamby 공식 `BaselineLoss` (**Weighted Focal Loss**) 생성 및 내부 텐서 속성(`alpha` 등) 디바이스 재귀 동기화<br>• `train_one_client`: `FedAvg`($\mu=0$) 및 `FedProx`($\mu>0$) 로컬 학습 (`num_updates=100` 고정 스텝 및 `local_epochs` 에폭 모드 지원, FLamby `Optimizer` 상태 유지, 순수 `BaselineLoss` 반환, 배치 크기 1 방어)<br>• `server_aggregate`: 6개 클라이언트 샘플 수 비례 가중 평균 집계<br>• `evaluate_model`: 단일 패스 추론으로 Global 지표 및 6개 병원별 공정성 지표(`macro_f1_std`, `macro_f1_gap`, `bal_acc_std`, `bal_acc_gap`, `client_balanced_acc`, `client_macro_f1`) 동시 산출<br>• `compute_ece` / `compute_weight_divergence` / `compute_round_comm_mb`: 15-bin ECE, L2 가중치 발산도, 라운드당 양방향 통신량(MB) 계산 |
+| **`data_utils.py`** | 데이터 파이프라인 | • `get_dataloaders`: FLamby 공식 6개 센터(`Center 0 ~ 5`, `NUM_CLIENTS = 6`) 학습 로더, Centralized 통합 로더, **Validation(Global/클라이언트별)** 로더, **Test(Global/클라이언트별)** 로더 생성<br>• `get_client_class_counts`: 이미지를 디코딩하지 않고 메타데이터에서 `(6, 8)` 클라이언트×클래스 학습 샘플 수 행렬($n_{k,c}$) 고속 추출<br>• `stratified_train_val_split` / `_build_center_datasets`: 센터별 FLamby train을 클래스 비율을 보존하며 **90% 학습 / 10% 검증** `Subset`으로 분할 (검증셋은 학습용 무작위 증강 없이 공식 test와 동일한 결정론적 변환 적용)<br>• FLamby 공식 클래스·상수·함수(`Baseline`, `BaselineLoss`, `Optimizer`, `BATCH_SIZE=64`, `LR=5e-4`, `NUM_CLIENTS=6`, `NUM_EPOCHS_POOLED=20`, `get_nb_max_rounds`) 임포트 및 제공<br>• `_seed_worker`: 멀티프로세싱 DataLoader 워커 난수 시드 고정 |
+| **`federated_core.py`** | 모델 및 연합학습 코어 | • `ClientStepIterator`: FLamby `DataLoaderWithMemory`와 동일하게 라운드 간 반복자(iterator) 상태를 유지하며 정확히 `num_updates` 스텝의 미니배치를 연속 공급<br>• `build_efficientnet_b0`: FLamby 공식 `Baseline` 모델(`EfficientNet-B0` 사전학습, `BatchNorm2d` 유지, 8클래스 분류기) 우선 생성 (`torchvision` 호환 fallback 포함)<br>• `build_baseline_loss` / `_sync_criterion_device`: FLamby 공식 `BaselineLoss` (**Weighted Focal Loss**) 생성 및 내부 텐서 속성(`alpha` 등) 디바이스 재귀 동기화<br>• `compute_cosine_lr` / `compute_client_adaptive_mus` / `compute_client_class_prox_weights`: **CA-FedProx** 전용 하한 보장 코사인 학습률 감쇠, 병원별 적응형 근접 계수 $\mu_k$, 분류기 행별 근접 가중치 벡터 산출<br>• `train_one_client`: `FedAvg`($\mu=0$), `FedProx`($\mu>0$), **`CA-FedProx`**($\mu_k$ 및 분류기 결측 클래스 보호) 로컬 학습 (`num_updates=100` 고정 스텝 및 `local_epochs` 에폭 모드 지원, FLamby `Optimizer` 상태 유지 및 라운드별 `lr` 갱신, 순수 `BaselineLoss` 반환, 배치 크기 1 방어)<br>• `server_aggregate`: 백본 샘플 수 비례 가중 평균 및 **CA-FedProx 분류기 헤드 클래스 빈도 인지 행별 집계**<br>• `evaluate_model`: 단일 패스 추론으로 Global 지표 및 6개 병원별 공정성 지표(`macro_f1_std`, `macro_f1_gap`, `bal_acc_std`, `bal_acc_gap`, `client_balanced_acc`, `client_macro_f1`) 동시 산출<br>• `compute_ece` / `compute_weight_divergence` / `compute_round_comm_mb`: 15-bin ECE, L2 가중치 발산도, 라운드당 양방향 통신량(MB) 계산 |
 | **`main.py`** | 학습 실행기 (CLI) | • `parse_args` / `set_seed`: FLamby 공식 하이퍼파라미터 및 공식 학습 스케줄(`--num_updates 100`, `get_nb_max_rounds`) 적용, 전체 난수 고정<br>• FLamby `_Model`과 동일하게 6개 클라이언트 로컬 모델(`client_models`) 및 로컬 옵티마이저(`client_optimizers = [Optimizer(...)]`)를 루프 밖에서 1회 생성하여 라운드 간 `Adam` 모멘텀 상태 유지<br>• 매 라운드 **Validation** 지표 실시간 CSV 로깅, 최고 Val 모델(`best_*.pt`) 및 세션 중단 복구용 체크포인트(`last_*.pt`, `--resume`, 클라이언트 옵티마이저 상태 포함) 원자적 저장<br>• `--final_test` (`_run_final_test`): 학습 종료 후 FLamby **Test 셋을 단 1회만** 평가(`*_final_test.json`, 예측 `*_final_test_preds.npz` 저장) |
 | **`fed_isic2019_colab.ipynb`** | 협업 실행 노트북 | • Phase 0~1: GPU 확인, Drive 마운트, FLamby 설치, ISIC 데이터 전처리(`tar` 캐싱) 및 6-Client Smoke Test<br>• Phase 2~4: **2단계 시드 분리 프로토콜**(Stage 1 `seed=41` 탐색 $\rightarrow$ Stage 2 `seed=42, 100, 2026` 본실험 및 `--final_test` 1회 평가)<br>• Phase 5: **Validation 및 Test `Mean ± Std` 요약표(Final 주 결과 / Best-Val 참고)**, **6개 병원별(Client 0~5) Test 세부 요약표(`summary_test_per_client_mean_std.csv`)**, 목표 정확도 도달 통신량 집계표, 학습 곡선 및 통신 효율성 그래프 자동 생성 |
 | **`DESIGN_DECISIONS_AND_CHANGELOG.md`** | 설계 문서 | • 아키텍처, 손실 함수, 공식 학습 스케줄, 클라이언트 옵티마이저 상태 유지, 평가 프로토콜 및 엔지니어링 최적화 내역과 학술적·기술적 근거 정리 |
@@ -56,7 +56,7 @@ FLamby의 `FedIsic2019`는 실제 의료기관 및 더모스코피 장비 출처
 - **옵티마이저 (`flamby.datasets.fed_isic2019.Optimizer`)**:
   - FLamby 공식 `Optimizer` (`torch.optim.Adam`, `lr = 5e-4`)를 사용하며, FLamby 전략 래퍼(`_Model`)와 동일하게 **각 클라이언트의 옵티마이저 인스턴스를 루프 밖에서 1회 생성하여 라운드 간 1·2차 모멘텀 상태를 유지**합니다.
 
-### 4.2 FLamby 공식 학습 스케줄 및 비교 기법 (3종)
+### 4.2 FLamby 공식 학습 스케줄 및 비교 기법 (4종)
 1. **`centralized` (상한 기준선)**:
    - 6개 클라이언트의 학습 데이터를 하나로 모아 단일 글로벌 모델을 학습합니다.
    - FLamby 공식 Pooled 스케줄에 따라 라운드당 `local_epochs = 1` 에폭씩 총 **`NUM_EPOCHS_POOLED = 20` 에폭** 동안 학습하며(`batch_size = 64`, `lr = 5e-4`), 에폭 간 `central_optimizer`(`Adam`) 상태를 유지합니다.
@@ -69,6 +69,18 @@ FLamby의 `FedIsic2019`는 실제 의료기관 및 더모스코피 장비 출처
    - `fedavg`와 동일하게 라운드당 **`num_updates = 100` 스텝**(`9` 라운드) 및 클라이언트별 `Adam` 상태 유지를 수행하되, 로컬 학습 목적함수에 글로벌 모델 $w_{\text{global}}^{(t)}$로부터의 이탈을 억제하는 근접 정규화 항(Proximal Term)을 추가하여 Non-IID 환경의 **Client Drift**를 완화합니다:
      $$\mathcal{L}_{\text{FedProx}}(w) = \mathcal{L}_{\text{Focal}}(w) + \frac{\mu}{2} \left\| w - w_{\text{global}}^{(t)} \right\|_2^2$$
    - 단, CSV에 기록되는 `train_loss`는 FedAvg와 동일 선상에서 비교할 수 있도록 근접 항을 제외한 순수 $\mathcal{L}_{\text{Focal}}(w)$만 기록합니다.
+4. **`cafedprox` (제안 기법: CA-FedProx)**:
+   - 다기관 의료 연합학습에서 표준 `FedProx`가 겪는 3가지 구조적 한계(대형 병원의 과도한 구속, 결측 클래스 병원에 의한 분류기 희석, 후반 라운드 진동)를 해결하기 위해 **공간(병원)·구조(분류기 계층)·시간(라운드)** 의 3축을 결합한 제안 알고리즘입니다:
+     1. **[공간 축] 병원 데이터 규모·클래스 다양성 기반 적응형 $\mu_k$ (`compute_client_adaptive_mus`)**:
+        $$\mu_k = \mu_{\text{base}} \cdot \left(1 - \frac{n_k}{N}\right)^2 \cdot \sqrt{\frac{C}{C_k}}$$
+        8개 전체 클래스를 보유한 거대 병원(`Client 0`, $\mu_0 \approx 0.0217$)의 과도한 구속을 풀어 빠른 수렴을 유도하고, 결측 클래스가 많고 데이터가 적은 소형 병원(`Client 4` $\mu_4 \approx 0.1520$, `Client 5` $\mu_5 \approx 0.1111$)에는 강한 드리프트 방어력을 부여합니다.
+     2. **[구조 축] 분류기 헤드 결측 클래스 근접 보호 및 클래스 인지 집계 (`compute_client_class_prox_weights`, `server_aggregate`)**:
+        - **로컬 학습**: 해당 병원에 샘플이 전혀 없는 결측 클래스($n_{k,c}=0$)의 분류기 행(row)에는 $2.0 \cdot \mu_{\text{base}}$의 강한 근접 페널티를 부여해 음의 그래디언트로 인한 판별 경계 붕괴(Negative-only Gradient Suppression)를 막고, 존재하는 소수 클래스 행에는 완화된 페널티를 적용합니다.
+        - **서버 집계**: 특징 추출기(Backbone)는 표준 샘플 수 비례 가중치($n_k/N$)로 집계하되, 마지막 선형 분류기(`_fc` / `classifier`)의 클래스 $c$ 행은 해당 클래스를 실제로 학습한 병원의 기여도를 우선 반영합니다:
+          $$\alpha_{k, c} = \gamma_{\text{cls}} \frac{n_{k,c}}{N_c} + (1 - \gamma_{\text{cls}}) \frac{n_k}{N} \quad (\gamma_{\text{cls}} = 0.7)$$
+     3. **[시간 축] 하한 보장 코사인 학습률 감쇠 (`compute_cosine_lr`)**:
+        $$\eta(r) = \eta_{\min} + \frac{1}{2}(\eta_0 - \eta_{\min})\left(1 + \cos\left(\frac{r - 1}{R - 1}\pi\right)\right), \quad \eta_{\min} = 0.2 \eta_0 = 1\text{e-}4$$
+        초반 라운드에서는 충분한 보폭으로 특징을 학습하고, 후반 라운드에서는 학습률을 부드럽게 감쇠시켜 로컬 최적점 진동을 억제합니다.
 
 ---
 
@@ -105,13 +117,18 @@ FLamby의 `FedIsic2019`는 실제 의료기관 및 더모스코피 장비 출처
 ### 6.1 `main.py` 지원 인자 목록
 | 인자 | 기본값 | 설명 |
 | :--- | :---: | :--- |
-| `--method` | `fedavg` | 학습 방식 선택: `centralized`, `fedavg`, `fedprox` |
+| `--method` | `fedavg` | 학습 방식 선택: `centralized`, `fedavg`, `fedprox`, **`cafedprox`** |
 | `--rounds` | `None` (자동) | 총 라운드 수. 미지정 시 연합학습은 `get_nb_max_rounds(num_updates)` (`9`), Centralized는 `NUM_EPOCHS_POOLED` (`20`) 자동 적용 |
 | `--num_updates` | `100` | 연합학습 라운드당 로컬 미니배치 업데이트(step) 횟수 (FLamby 공식 기본값: `100`) |
 | `--local_epochs` | `1` | Centralized의 라운드당 에폭 수 (또는 `--num_updates <= 0`일 때의 로컬 에폭 수) |
 | `--batch_size` | `BATCH_SIZE` (`64`) | 미니배치 크기 (`flamby.datasets.fed_isic2019.BATCH_SIZE`) |
-| `--lr` | `LR` (`5e-4`) | `Optimizer` (`torch.optim.Adam`) 학습률 (`flamby.datasets.fed_isic2019.LR`) |
-| `--mu` | `0.01` | FedProx 근접 항 계수 (`fedavg`/`centralized`에서는 자동으로 `0.0` 적용) |
+| `--lr` | `LR` (`5e-4`) | `Optimizer` (`torch.optim.Adam`) 초기 학습률 (`flamby.datasets.fed_isic2019.LR`) |
+| `--mu` | `0.01` | FedProx / CA-FedProx 기준 근접 항 계수 $\mu_{\text{base}}$ (`fedavg`/`centralized`에서는 자동으로 `0.0` 적용) |
+| `--lr_schedule` | `auto` | 라운드별 학습률 스케줄 (`auto`: `cafedprox`는 `cosine`, 나머지는 `constant`; 또는 `constant`, `cosine` 직접 지정) |
+| `--min_lr_ratio` | `0.2` | 코사인 학습률 감쇠 시 마지막 라운드 최소 학습률 비율 ($\eta_{\min} / \eta_0$) |
+| `--class_agg_gamma` | `0.7` | `cafedprox` 분류기 헤드 집계 시 클래스 빈도 가중치 혼합 비율 $\gamma_{\text{cls}} \in [0, 1]$ |
+| `--no_adaptive_mu` | `False` (플래그) | (Ablation용) `cafedprox`에서 병원별 적응형 $\mu_k$를 끄고 고정 `--mu` 사용 |
+| `--no_class_aware` | `False` (플래그) | (Ablation용) `cafedprox`에서 분류기 헤드 클래스 인지 집계 및 결측 클래스 보호 비활성화 |
 | `--seed` | `42` | 재현성 및 다중 시드 실험용 난수 시드 (탐색 시드: `41`, 본실험 3시드: `42, 100, 2026`) |
 | `--num_workers` | `4` | DataLoader CPU 워커 프로세스 수 (코랩 기본 런타임 권장: `2`) |
 | `--data_path` | `None` | 전처리된 `ISIC_2019_Training_Input_preprocessed` 폴더가 위치한 상위 디렉토리 경로 |
@@ -132,8 +149,11 @@ python main.py --method centralized --local_epochs 1 --seed 42 --data_path ./isi
 # 2. FedAvg 본실험 (num_updates=100, 9 라운드 자동 적용, 학습 종료 후 1회 --final_test)
 python main.py --method fedavg --num_updates 100 --mu 0.0 --seed 42 --data_path ./isic_data --save_dir ./results --resume --final_test
 
-# 3. FedProx 본실험 (선정된 BEST_MU 적용, num_updates=100, 9 라운드 자동 적용, 학습 종료 후 1회 --final_test)
-python main.py --method fedprox --num_updates 100 --mu 0.01 --seed 42 --data_path ./isic_data --save_dir ./results --resume --final_test
+# 3. FedProx 본실험 (선정된 BEST_MU=0.1 적용, num_updates=100, 9 라운드 자동 적용, 학습 종료 후 1회 --final_test)
+python main.py --method fedprox --num_updates 100 --mu 0.1 --seed 42 --data_path ./isic_data --save_dir ./results --resume --final_test
+
+# 4. 제안 기법 CA-FedProx 본실험 (BEST_MU=0.1 기준 적응형 mu_k + 클래스 인지 분류기 + 코사인 LR 감쇠 자동 적용)
+python main.py --method cafedprox --num_updates 100 --mu 0.1 --seed 42 --data_path ./isic_data --save_dir ./results --resume --final_test
 ```
 
 ---

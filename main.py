@@ -13,6 +13,7 @@ from data_utils import (
     NUM_CLIENTS,
     NUM_EPOCHS_POOLED,
     Optimizer,
+    get_client_class_counts,
     get_dataloaders,
     get_nb_max_rounds,
 )
@@ -20,6 +21,9 @@ from federated_core import (
     ClientStepIterator,
     build_baseline_loss,
     build_efficientnet_b0,
+    compute_client_adaptive_mus,
+    compute_client_class_prox_weights,
+    compute_cosine_lr,
     compute_model_size_mb,
     compute_round_comm_mb,
     compute_weight_divergence,
@@ -85,14 +89,14 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fed-ISIC2019 6-Client Federated Learning (Centralized / FedAvg / FedProx)"
+        description="Fed-ISIC2019 6-Client Federated Learning (Centralized / FedAvg / FedProx / CA-FedProx)"
     )
     parser.add_argument(
         "--method",
         type=str,
         default="fedavg",
-        choices=["centralized", "fedavg", "fedprox"],
-        help="학습 방식 선택: centralized, fedavg, fedprox",
+        choices=["centralized", "fedavg", "fedprox", "cafedprox"],
+        help="학습 방식 선택: centralized, fedavg, fedprox, cafedprox (제안 알고리즘: 적응형 mu_k + 결측 클래스 인지 분류기 집계 + Cosine LR)",
     )
     parser.add_argument(
         "--rounds",
@@ -108,7 +112,7 @@ def parse_args():
         type=int,
         default=100,
         help=(
-            "연합학습(fedavg/fedprox)에서 라운드당 클라이언트 로컬 미니배치 업데이트(step) 횟수 "
+            "연합학습(fedavg/fedprox/cafedprox)에서 라운드당 클라이언트 로컬 미니배치 업데이트(step) 횟수 "
             "(FLamby 공식 벤치마크 기본값: 100). 0 이하로 주면 --local_epochs 기반으로 동작"
         ),
     )
@@ -134,7 +138,36 @@ def parse_args():
         "--mu",
         type=float,
         default=0.01,
-        help="FedProx 근접 항 계수 (method='fedprox'일 때 적용, fedavg/centralized는 0.0으로 강제)",
+        help="FedProx / CA-FedProx 기준 근접 항 계수 (method='fedprox'/'cafedprox'일 때 적용, fedavg/centralized는 0.0으로 강제)",
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="auto",
+        choices=["auto", "constant", "cosine"],
+        help="라운드별 학습률 스케줄 ('auto': cafedprox는 cosine, 나머지는 constant)",
+    )
+    parser.add_argument(
+        "--min_lr_ratio",
+        type=float,
+        default=0.2,
+        help="Cosine LR 감쇠 시 최종 라운드 최소 학습률 비율 (기본값: 0.2 -> 5e-4에서 1e-4로 완만히 감쇠)",
+    )
+    parser.add_argument(
+        "--class_agg_gamma",
+        type=float,
+        default=0.7,
+        help="CA-FedProx 분류기 헤드 집계 시 클래스별 샘플 비율(n_{k,c}/N_c) 반영 가중치 (기본값: 0.7)",
+    )
+    parser.add_argument(
+        "--no_adaptive_mu",
+        action="store_true",
+        help="[Ablation용] cafedprox에서 병원별 적응형 mu_k를 끄고 고정 mu를 사용",
+    )
+    parser.add_argument(
+        "--no_class_aware",
+        action="store_true",
+        help="[Ablation용] cafedprox에서 결측 클래스 인지 분류기 집계 및 근접 마스킹을 비활성화",
     )
     parser.add_argument(
         "--save_dir",
@@ -349,7 +382,16 @@ def main():
             else:
                 args.rounds = NUM_EPOCHS_POOLED
 
-    effective_mu = args.mu if args.method == "fedprox" else 0.0
+    effective_mu = args.mu if args.method in ("fedprox", "cafedprox") else 0.0
+    if args.lr_schedule == "auto":
+        effective_lr_schedule = "cosine" if args.method == "cafedprox" else "constant"
+    else:
+        effective_lr_schedule = args.lr_schedule
+
+    use_adaptive_mu = (args.method == "cafedprox") and (not args.no_adaptive_mu)
+    use_class_aware = (args.method == "cafedprox") and (not args.no_class_aware)
+    effective_class_gamma = args.class_agg_gamma if use_class_aware else 0.0
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] Using device: {device} | Seed: {args.seed}")
     schedule_desc = (
@@ -359,7 +401,7 @@ def main():
     )
     print(
         f"[Info] Method: {args.method} | Clients: {NUM_CLIENTS} | Rounds: {args.rounds} | "
-        f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} | Mu: {effective_mu}"
+        f"{schedule_desc} | Batch Size: {args.batch_size} | LR: {args.lr} ({effective_lr_schedule}) | Mu: {effective_mu}"
     )
 
     # 1. DataLoader 준비 (FLamby 공식 6개 센터: Center 0 ~ 5)
@@ -388,6 +430,40 @@ def main():
         f"(val_fraction={args.val_fraction}, split_seed={args.split_seed})"
     )
 
+    # CA-FedProx: 클라이언트×클래스 샘플 분포 추출 및 병원별 적응형 mu_k / 클래스 인지 가중치 계산
+    if args.method == "cafedprox" or use_adaptive_mu or use_class_aware:
+        client_class_counts = get_client_class_counts(client_loaders, num_classes=8)
+        if use_adaptive_mu:
+            client_mus = compute_client_adaptive_mus(
+                base_mu=effective_mu, client_class_counts=client_class_counts, num_classes=8
+            )
+        else:
+            client_mus = [effective_mu for _ in range(num_clients)]
+
+        if use_class_aware:
+            client_class_prox_weights = [
+                compute_client_class_prox_weights(
+                    base_mu=effective_mu,
+                    client_mu=client_mus[k],
+                    client_class_counts_k=client_class_counts[k],
+                )
+                for k in range(num_clients)
+            ]
+        else:
+            client_class_prox_weights = [None for _ in range(num_clients)]
+
+        present_classes_per_client = [int(np.sum(client_class_counts[k] > 0)) for k in range(num_clients)]
+        print(
+            f"[CA-FedProx] Present classes per client: {present_classes_per_client} | "
+            f"Client-Adaptive mu_k: {[round(m, 4) for m in client_mus]} | "
+            f"Class-Aware Head Gamma: {effective_class_gamma:.2f} | "
+            f"LR Schedule: {effective_lr_schedule} (min_ratio={args.min_lr_ratio})"
+        )
+    else:
+        client_class_counts = None
+        client_mus = [effective_mu for _ in range(num_clients)]
+        client_class_prox_weights = [None for _ in range(num_clients)]
+
     # 2. FLamby 공식 손실 함수 (BaselineLoss: Weighted Focal Loss) 초기화
     criterion = build_baseline_loss(device=device)
 
@@ -406,7 +482,7 @@ def main():
 
     # FLamby 공식 구현(_Model 및 Optimizer = torch.optim.Adam)과 동일하게 옵티마이저를 루프 밖에서 1회 생성해 상태 유지:
     # - Centralized: 단일 글로벌 모델에 대한 central_optimizer 유지
-    # - 연합학습(FedAvg/FedProx): 6개 클라이언트별 로컬 모델(client_models)과 로컬 옵티마이저(client_optimizers)를
+    # - 연합학습(FedAvg/FedProx/CA-FedProx): 6개 클라이언트별 로컬 모델(client_models)과 로컬 옵티마이저(client_optimizers)를
     #   루프 밖에서 1회 생성하고, 매 라운드 글로벌 가중치만 load_state_dict로 동기화하여 Adam 모멘텀 상태를 유지
     if args.method == "centralized":
         central_optimizer = Optimizer(global_model.parameters(), lr=args.lr)
@@ -419,11 +495,21 @@ def main():
             Optimizer(m.parameters(), lr=args.lr) for m in client_models
         ]
 
-    # 4. 결과 기록용 CSV 및 모델 저장 경로 설정 (시드 및 FedProx mu 값 구분)
-    if args.method == "fedprox":
+    # 4. 결과 기록용 CSV 및 모델 저장 경로 설정 (시드 및 FedProx / CA-FedProx mu 값 구분)
+    if args.method in ("fedprox", "cafedprox"):
         exp_tag = f"{args.method}_mu{effective_mu:g}"
     else:
         exp_tag = f"{args.method}"
+
+    if args.method != "cafedprox" and effective_lr_schedule == "cosine":
+        exp_tag += "_coslr"
+    elif args.method == "cafedprox":
+        if args.no_adaptive_mu:
+            exp_tag += "_noadamu"
+        if args.no_class_aware:
+            exp_tag += "_nocls"
+        if effective_lr_schedule == "constant":
+            exp_tag += "_constlr"
 
     csv_path = os.path.join(args.save_dir, f"{exp_tag}_seed{args.seed}_metrics.csv")
     best_model_path = os.path.join(args.save_dir, f"best_{exp_tag}_seed{args.seed}.pt")
@@ -434,6 +520,10 @@ def main():
         "mu": effective_mu,
         "seed": args.seed,
         "lr": args.lr,
+        "lr_schedule": effective_lr_schedule,
+        "min_lr_ratio": args.min_lr_ratio,
+        "class_agg_gamma": effective_class_gamma,
+        "adaptive_mu": use_adaptive_mu,
         "rounds": args.rounds,
         "num_updates": effective_num_updates,
         "local_epochs": args.local_epochs,
@@ -495,12 +585,23 @@ def main():
 
     # 6. 라운드별 학습 및 평가 루프
     for r in range(start_round, args.rounds + 1):
+        round_lr = (
+            compute_cosine_lr(
+                base_lr=args.lr,
+                current_round=r,
+                total_rounds=args.rounds,
+                min_lr_ratio=args.min_lr_ratio,
+            )
+            if effective_lr_schedule == "cosine"
+            else args.lr
+        )
+
         if args.method == "centralized":
             global_model, train_loss = train_one_client(
                 model=global_model,
                 dataloader=centralized_loader,
                 criterion=criterion,
-                lr=args.lr,
+                lr=round_lr,
                 local_epochs=args.local_epochs,
                 device=device,
                 mu=0.0,
@@ -515,8 +616,8 @@ def main():
             local_losses = []
             divergences = []
 
-            for c_model, c_opt, step_iter in zip(
-                client_models, client_optimizers, client_step_iterators
+            for k, (c_model, c_opt, step_iter) in enumerate(
+                zip(client_models, client_optimizers, client_step_iterators)
             ):
                 # FLamby _Model과 동일하게 로컬 모델 파라미터에 현재 글로벌 가중치를 인플레이스 동기화하되,
                 # 파라미터 텐서 인스턴스와 로컬 옵티마이저(Adam 모멘텀 상태)는 라운드 간 그대로 유지
@@ -525,13 +626,15 @@ def main():
                     model=c_model,
                     dataloader=step_iter,
                     criterion=criterion,
-                    lr=args.lr,
+                    lr=round_lr,
                     local_epochs=args.local_epochs,
                     device=device,
-                    mu=effective_mu,
+                    mu=client_mus[k],
                     global_model=global_model,
                     optimizer=c_opt,
                     num_updates=effective_num_updates,
+                    class_prox_weights=client_class_prox_weights[k],
+                    num_classes=8,
                 )
 
                 div = compute_weight_divergence(global_model, trained_local_model)
@@ -539,7 +642,7 @@ def main():
                 local_losses.append(c_loss)
                 divergences.append(div)
 
-            # 샘플 수 비례 가중 평균으로 글로벌 모델 업데이트 및 평균 손실(BaselineLoss 기준) 계산
+            # 샘플 수 비례 가중 평균으로 평균 손실(BaselineLoss 기준) 계산
             total_samples = sum(client_sample_counts)
             train_loss = sum(
                 l * n for l, n in zip(local_losses, client_sample_counts)
@@ -550,6 +653,9 @@ def main():
                 global_model=global_model,
                 client_models=local_models,
                 client_sample_counts=client_sample_counts,
+                client_class_counts=client_class_counts if use_class_aware else None,
+                class_agg_gamma=effective_class_gamma,
+                num_classes=8,
             )
 
         # 글로벌 검증셋 및 클라이언트별 검증셋 평가 (test는 학습 종료 후 --final_test로 1회만 평가)

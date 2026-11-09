@@ -16,6 +16,7 @@
 | **6** | **다중 시드 실험 전략** | **2단계 시드 분리** (`seed=41` 탐색 $\rightarrow$ `seed=42, 100, 2026` 본실험) | 하이퍼파라미터($\mu$) 선택 시드와 최종 보고용 3시드를 완전히 분리하여 통계적 엄밀성(`Mean ± Std`) 확보 및 코랩 탐색 시간 절감 |
 | **7** | **다각도 평가지표 체계** | **`Balanced Acc`**, **`Macro-F1`**, 병원별 **`balanced_acc_client0~5` / `macro_f1_client0~5`**, 병원 간 **`macro_f1_std` / `bal_acc_std`** 및 **`Gap`**, **`15-bin ECE`**, **`Weight Divergence`**, **`Cumulative Comm (MB)`** | 불균형 분류 성능뿐만 아니라 초소형 병원 노이즈에 강건한 병원 간 공정성(Fairness: Std & Gap), 신뢰도 보정(Calibration), Client Drift, 통신 효율성을 종합 평가 |
 | **8** | **엔지니어링 최적화 및 안정화** | 단일 패스 추론, 클라이언트/글로벌 옵티마이저 상태 유지, 순수 손실 로깅, `BN` 크기 1 방어, `--resume` 원자적 체크포인트 | 평가 속도 2배 향상, FLamby 공식 동작 완벽 재현, 코랩 세션 중단 시 무손실 재개 및 GPU/CPU 디바이스 동기화 보장 |
+| **9** | **제안 알고리즘 (`CA-FedProx`)** | **공간(적응형 $\mu_k$) + 구조(클래스 인지 분류기 집계·결측 클래스 보호) + 시간(하한 보장 코사인 LR 감쇠)** 3축 결합 (`--method cafedprox`) | 단일 고정 $\mu$의 거대 병원 과구속, 결측 클래스 병원에 의한 희소 클래스(`SCC`) 분류기 판별 경계 희석, 후반 라운드 로컬 최적점 진동 문제를 동시에 해결 |
 
 ---
 
@@ -150,3 +151,29 @@
 | **8.4** | `main.py` | **클라이언트별 `Optimizer` 및 `Centralized` 옵티마이저 모멘텀 상태 유지** | FLamby 공식 `_Model`과 동일하게 연합학습에서는 6개 클라이언트의 로컬 모델과 `Optimizer`(`Adam`)를 루프 밖에서 1회 생성해 라운드 간 모멘텀을 유지하고, `Centralized`는 `central_optimizer`로 에폭 간 모멘텀을 유지함. |
 | **8.5** | `main.py` | **`--resume` 이어서 학습 및 원자적(Atomic) 체크포인트 저장** | 코랩 세션 중단 시 마지막 완료 라운드 다음부터 즉시 재개할 수 있도록 모델·옵티마이저(`central_optimizer` 및 6개 `client_optimizers`)·난수 상태를 저장하며, `.tmp` 작성 후 `os.replace`로 원자적 교체를 수행함. |
 | **8.6** | `fed_isic2019_colab.ipynb` | **Google Drive `tar` 캐싱 + 로컬 디스크(`/content`) 고속 I/O** | 23,247장 전처리 이미지를 최초 1회만 생성해 Drive에 단일 `tar`로 보관하고, 매 세션 로컬 디스크로 압축 해제하여 Google Drive FUSE 마운트의 I/O 병목을 해결함. |
+
+---
+
+## 9. 제안 알고리즘: `CA-FedProx` (Class- & Client-Aware FedProx with Warm-Floor Cosine LR Decay) (`data_utils.py`, `federated_core.py`, `main.py`)
+
+### 📌 설계 배경 (기존 `FedProx`의 3가지 한계 규명)
+3-시드 본실험(`42, 100, 2026`) 결과, 표준 `FedProx($\mu=0.1$)`는 `FedAvg` 대비 Client Drift(`weight_divergence`: $2.50 \rightarrow 1.29$)를 절반으로 줄였으나 Test Global Balanced Accuracy($57.53\% \rightarrow 56.11\%$)가 오히려 $1.42\%\text{p}$ 하락하는 현상이 확인되었음. 원인 분석 결과 다음 3가지 구조적 병목이 확인됨:
+1. **공간(병원) 축 — 단일 고정 $\mu$로 인한 거대 병원(`Client 0`) 과구속(Over-regularization)**:
+   - 전체 데이터의 $53.4\%$와 8개 전 클래스를 보유한 `Client 0`까지 소형 병원과 동일한 $\mu=0.1$로 묶어버려, 9 라운드(`900` 스텝) 안에 충분한 특징 표현을 학습하지 못하고 `Client 0` Balanced Accuracy가 $64.45\% \rightarrow 61.91\%$로 급락함.
+2. **구조(분류기 계층) 축 — 결측 클래스 병원에 의한 희소 클래스(`SCC`, `AK`) 판별 경계 희석(Classifier Dilution)**:
+   - `7: SCC(편평세포암)`는 `Client 0`과 `Client 3`에만 존재하고 나머지 4개 병원(`Client 1, 2, 4, 5`, 전체 가중치 합 $36.9\%$)에는 샘플이 **0장**임.
+   - 결측 병원에서 로컬 학습을 100 스텝 수행하는 동안 `SCC` 분류기 행(row)은 정답($y=7$)으로부터 양의 그래디언트를 한 번도 받지 못하고 오직 음의 그래디언트(Negative-only Softmax Gradient)만 받아 가중치가 억제되며, 서버가 전체 샘플 수 비례($n_k/N$)로 분류기까지 일괄 평균낼 때 `Client 0, 3`이 학습한 `SCC` 판별 경계가 훼손됨 (`SCC` Recall: `FedAvg` $38.0\%$, `FedProx` $31.3\%$).
+3. **시간(라운드) 축 — 고정 학습률(`5e-4`)로 인한 후반 라운드 로컬 최적점 진동**:
+   - 라운드 간 `Adam` 모멘텀을 유지하는 상태에서 마지막 9라운드까지 초기 학습률 `5e-4`를 그대로 유지하면, 후반 라운드에서 각 병원의 편향된 로컬 최적점 방향으로 과도하게 이동하여 집계 직후 성능이 흔들림.
+
+### 💡 `CA-FedProx`의 3축 핵심 메커니즘
+1. **[공간 축] 병원 데이터 규모 및 클래스 다양성 기반 적응형 $\mu_k$ (`compute_client_adaptive_mus`)**:
+   $$\mu_k = \mu_{\text{base}} \cdot \left(1 - \frac{n_k}{N}\right)^2 \cdot \sqrt{\frac{C}{C_k}}$$
+   - 8클래스를 모두 보유한 대형 병원 `Client 0`에는 $\mu_0 \approx 0.0217$의 완화된 정규화를 적용해 표현 학습 속도를 높이고, 3개 클래스만 보유한 소형 병원 `Client 4`($\mu_4 \approx 0.1520$)와 초소형 병원 `Client 5`($\mu_5 \approx 0.1111$)에는 강한 근접 제약을 부여해 편향 드리프트를 억제함.
+2. **[구조 축] 분류기 헤드 결측 클래스 근접 보호 및 클래스 빈도 인지 집계 (`compute_client_class_prox_weights`, `server_aggregate`)**:
+   - **로컬 학습 시 결측 클래스 앵커링 및 소수 클래스 완화**: 분류기 헤드(`_fc` / `classifier`)의 각 클래스 행 $c$에 서로 다른 근접 계수 $\mu_{k,c}$를 부여함. 결측 클래스($n_{k,c}=0$) 행에는 $\mu_{k,c} = 2.0 \cdot \mu_{\text{base}}$를 적용해 글로벌 분류기 가중치에 단단히 고정하고, 존재하는 클래스($n_{k,c}>0$) 행에는 클래스 빈도에 비례해 완화된 계수 $\mu_{k,c} = \mu_k \cdot (0.5 + 0.5 \frac{n_{k,c}}{n_{k,\max}})$를 적용하여 소수 클래스(`MEL`, `BKL`, `VASC`, `SCC`) 판별 경계 이동을 허용함.
+   - **서버 집계 시 백본-분류기 분리 집계 (Decoupled Aggregation)**: 특징 추출기(Backbone)는 전체 샘플 수 비율 $n_k / N$로 집계하되, 분류기 헤드의 클래스 $c$ 행(`weight[c]`, `bias[c]`)은 해당 클래스 샘플 비율($n_{k,c}/N_c$)과 전체 샘플 비율($n_k/N$)을 결합한 가중치로 집계함:
+     $$\alpha_{k, c} = \gamma_{\text{cls}} \frac{n_{k,c}}{N_c} + (1 - \gamma_{\text{cls}}) \frac{n_k}{N} \quad (\gamma_{\text{cls}} = 0.7)$$
+3. **[시간 축] 하한 보장 코사인 학습률 감쇠 (`compute_cosine_lr`)**:
+   $$\eta(r) = \eta_{\min} + \frac{1}{2}(\eta_0 - \eta_{\min})\left(1 + \cos\left(\frac{r - 1}{R - 1}\pi\right)\right), \quad \eta_{\min} = 0.2 \eta_0 = 1\text{e-}4$$
+   - 기존 `client_optimizers`의 `Adam` 1·2차 모멘텀 상태는 그대로 보존하면서 매 라운드 `param_group["lr"]`만 코사인 곡선으로 감쇠하여 초반 특징 학습 속도와 후반 수렴 안정성을 동시에 확보함.

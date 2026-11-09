@@ -115,6 +115,107 @@ def compute_round_comm_mb(model: nn.Module, num_clients: int) -> float:
     return float(2.0 * num_clients * compute_model_size_mb(model))
 
 
+def _get_classifier_param_names(model: nn.Module, num_classes: int = 8) -> tuple[str | None, str | None]:
+    """
+    모델에서 최종 분류기(nn.Linear, out_features == num_classes)의 weight 및 bias 파라미터 이름을 찾습니다.
+    FLamby 공식 Baseline(`_fc.weight`, `_fc.bias` 또는 `base_model._fc.*`)과
+    torchvision EfficientNet-B0(`classifier.1.weight`, `classifier.1.bias`) 모두 자동 호환됩니다.
+    """
+    weight_name = None
+    bias_name = None
+    for module_name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and module.out_features == num_classes:
+            prefix = f"{module_name}." if module_name else ""
+            weight_name = f"{prefix}weight"
+            bias_name = f"{prefix}bias" if module.bias is not None else None
+    return weight_name, bias_name
+
+
+def compute_cosine_lr(
+    base_lr: float,
+    current_round: int,
+    total_rounds: int,
+    min_lr_ratio: float = 0.2,
+) -> float:
+    """
+    라운드 진행(1 ~ total_rounds)에 따라 base_lr에서 (base_lr * min_lr_ratio)까지
+    하한선이 보장된 완만한 코사인 감쇠(Warm-Floor Cosine Annealing) 학습률을 계산합니다.
+    - Non-IID 연합학습의 후반부 라운드에서 병원 간 로컬 최적점 진동(Oscillation)을 억제하고
+      정밀 수렴(Fine-grained Convergence)을 유도합니다.
+    """
+    if total_rounds <= 1 or current_round <= 1:
+        return float(base_lr)
+    min_lr = float(base_lr * min_lr_ratio)
+    progress = float(min(max(current_round - 1, 0), total_rounds - 1)) / float(total_rounds - 1)
+    cosine_decay = 0.5 * (1.0 + float(np.cos(np.pi * progress)))
+    return float(min_lr + (base_lr - min_lr) * cosine_decay)
+
+
+def compute_client_adaptive_mus(
+    base_mu: float,
+    client_class_counts: np.ndarray,
+    num_classes: int = 8,
+) -> list[float]:
+    """
+    CA-FedProx 모듈 1 — 병원 비대칭 인지 적응형 근접 계수(Client-Adaptive mu_k)를 계산합니다.
+
+    수식:
+        mu_k = base_mu * (1 - n_k / N)^2 * sqrt(C / C_k)
+
+    - n_k / N: 전체 학습 데이터 중 병원 k가 차지하는 비중.
+      초대형 병원(Client 0, 53.4%)은 글로벌 분포의 주축이므로 과도한 근접 제약을 완화해(mu_0 ≈ 0.022)
+      9라운드 내 빠른 특징 수렴을 유도하고, 소규모 병원일수록 (1 - n_k / N)^2 -> 1이 되어 드리프트를 방어합니다.
+    - sqrt(C / C_k): 전체 클래스 수(C=8) 대비 병원 k가 실제로 보유한 클래스 수(C_k)의 불완전성 페널티.
+      결측 클래스가 많은 극단적 편향 병원(예: Client 4, 3개 클래스만 보유)에 더 강한 근접 정규화(mu_4 ≈ 0.152)를
+      부여하여 로컬 편향 과적합 및 성능 붕괴를 방지합니다.
+    """
+    if base_mu <= 0.0:
+        return [0.0 for _ in range(len(client_class_counts))]
+
+    counts = np.asarray(client_class_counts, dtype=np.float64)
+    client_totals = counts.sum(axis=1)
+    total_samples = max(float(client_totals.sum()), 1.0)
+
+    adaptive_mus = []
+    for k in range(len(counts)):
+        n_k = float(client_totals[k])
+        c_k = max(int(np.sum(counts[k] > 0)), 1)
+        size_factor = (1.0 - (n_k / total_samples)) ** 2
+        class_diversity_factor = float(np.sqrt(float(num_classes) / float(c_k)))
+        mu_k = float(base_mu * size_factor * class_diversity_factor)
+        adaptive_mus.append(mu_k)
+    return adaptive_mus
+
+
+def compute_client_class_prox_weights(
+    base_mu: float,
+    client_mu: float,
+    client_class_counts_k: np.ndarray,
+) -> np.ndarray:
+    """
+    CA-FedProx 모듈 2 (Client-side) — 분류기 헤드(Classifier Linear Layer)의 클래스 행별 근접 가중치 배율(rho_{k,c})을 계산합니다.
+
+    - 결측 클래스 (n_{k,c} == 0): 병원 k에 샘플이 0장인 클래스는 로컬 학습 시 Softmax 음수 그래디언트만 받아
+      결정 경계가 지워지는(Forgetting/Suppression) 현상이 발생하므로, 유효 근접 계수가 `2.0 * base_mu`가 되도록
+      글로벌 분류기 행에 강하게 고정(Anchoring)합니다.
+    - 보유 클래스 (n_{k,c} > 0): 다수 클래스(NV, n_{k,c} == n_{k,max})는 과다 예측 방지를 위해 배율 1.0을 유지하고,
+      병원 내 희귀·소수 암 클래스(MEL, SCC, AK, DF, VASC 등)는 배율을 0.5 ~ 1.0으로 완화하여 민감도(Recall) 학습을 촉진합니다.
+    """
+    counts_k = np.asarray(client_class_counts_k, dtype=np.float64)
+    max_count = max(float(np.max(counts_k)), 1.0)
+    safe_client_mu = max(float(client_mu), 1e-8)
+
+    rho = np.ones(len(counts_k), dtype=np.float32)
+    for c, cnt in enumerate(counts_k):
+        if cnt <= 0:
+            # 결측 클래스: 유효 근접 페널티를 2.0 * base_mu 수준으로 강화하여 타 병원 희귀암 분류기 훼손 방지
+            rho[c] = float((2.0 * base_mu) / safe_client_mu) if base_mu > 0 else 1.0
+        else:
+            # 보유 클래스: 병원 내 소수 클래스일수록 0.5에 가까워져 결정 경계 적응 자유도 부여, 최다수 클래스(NV)는 1.0
+            rho[c] = float(0.5 + 0.5 * (cnt / max_count))
+    return rho
+
+
 def train_one_client(
     model: nn.Module,
     dataloader,
@@ -126,47 +227,46 @@ def train_one_client(
     global_model: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     num_updates: int | None = None,
+    class_prox_weights: np.ndarray | torch.Tensor | None = None,
+    num_classes: int = 8,
 ) -> tuple[nn.Module, float]:
     """
     단일 클라이언트(또는 Centralized) 모델을 학습합니다.
     - num_updates가 지정된 경우(연합학습 공식 스케줄): 라운드당 정확히 `num_updates` 미니배치 스텝(기본 100 스텝)을 수행합니다.
     - num_updates가 None인 경우(Centralized 공식 스케줄): `local_epochs` 에폭만큼 전체 데이터를 순회합니다.
     - mu == 0.0: FedAvg (FLamby 공식 BaselineLoss: Weighted Focal Loss 학습)
-    - mu > 0.0: FedProx (Objective에 (mu / 2) * ||w - w_global||_2^2 정규화 항 추가)
-
-    Args:
-        model: 학습할 로컬 모델
-        dataloader: 클라이언트 학습 DataLoader 또는 ClientStepIterator
-        criterion: 손실 함수 (FLamby BaselineLoss — Weighted Focal Loss)
-        lr: 학습률 (FLamby 공식 기본값: 5e-4)
-        local_epochs: 로컬 에폭 수 (num_updates가 None일 때 사용)
-        device: 학습 디바이스
-        mu: FedProx 근접 항 계수 (0.0이면 FedAvg)
-        global_model: FedProx 기준이 되는 글로벌 모델 (None이면 학습 시작 시점의 model 스냅샷 사용)
-        optimizer: 외부에서 유지하는 옵티마이저.
-                   FLamby 공식 구현(_Model)과 동일하게 연합학습(client_optimizers[k]) 및
-                   Centralized(central_optimizer) 모두 라운드/에폭 간 Adam 상태를 유지합니다.
-                   None이면 FLamby 공식 Optimizer(torch.optim.Adam)를 새로 생성합니다.
-        num_updates: 라운드당 로컬 업데이트(미니배치 스텝) 횟수. FLamby 공식 벤치마크는 100을 사용
+    - mu > 0.0: FedProx / CA-FedProx (Objective에 (mu / 2) * ||w - w_global||_2^2 정규화 항 추가)
+    - class_prox_weights가 제공된 경우(CA-FedProx): 마지막 분류기 헤드의 클래스별 행(c=0..7)에
+      결측/소수 클래스 인지 가중치 배율(rho_{k,c})을 적용합니다.
 
     Returns:
         tuple: (학습된 local_model, 평균 train loss)
-            - 반환 손실은 근접 항을 제외한 순수 분류 손실(BaselineLoss)이므로 FedAvg/FedProx 간 직접 비교 가능
+            - 반환 손실은 근접 항을 제외한 순수 분류 손실(BaselineLoss)이므로 FedAvg/FedProx/CA-FedProx 간 직접 비교 가능
     """
     model.to(device)
     model.train()
     _sync_criterion_device(criterion, device)
 
     if mu > 0.0:
-        if global_model is None:
-            global_params = [p.detach().clone().to(device) for p in model.parameters()]
-        else:
-            global_params = [p.detach().clone().to(device) for p in global_model.parameters()]
+        ref_model = model if global_model is None else global_model
+        global_named_params = [
+            (name, p.detach().clone().to(device)) for name, p in ref_model.named_parameters()
+        ]
     else:
-        global_params = None
+        global_named_params = None
+
+    cls_weight_name, cls_bias_name = _get_classifier_param_names(model, num_classes=num_classes)
+    if class_prox_weights is not None and mu > 0.0:
+        cls_prox_tensor = torch.as_tensor(class_prox_weights, dtype=torch.float32, device=device)
+    else:
+        cls_prox_tensor = None
 
     if optimizer is None:
         optimizer = Optimizer(model.parameters(), lr=lr)
+    else:
+        # 라운드별 학습률 스케줄링(예: Cosine LR Decay) 적용 시 기존 Adam 모멘텀은 유지하고 lr만 갱신
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
 
     total_base_loss = 0.0
     total_samples = 0
@@ -185,10 +285,16 @@ def train_one_client(
         base_loss = criterion(logits, targets)
         loss = base_loss
 
-        if mu > 0.0 and global_params is not None:
+        if mu > 0.0 and global_named_params is not None:
             prox_term = torch.tensor(0.0, device=device)
-            for local_p, global_p in zip(model.parameters(), global_params):
-                prox_term = prox_term + torch.sum((local_p - global_p) ** 2)
+            for (name, local_p), (_, global_p) in zip(model.named_parameters(), global_named_params):
+                diff_sq = (local_p - global_p) ** 2
+                if cls_prox_tensor is not None and name == cls_weight_name and diff_sq.ndim == 2:
+                    prox_term = prox_term + torch.sum(diff_sq.sum(dim=1) * cls_prox_tensor)
+                elif cls_prox_tensor is not None and name == cls_bias_name and diff_sq.ndim == 1:
+                    prox_term = prox_term + torch.sum(diff_sq * cls_prox_tensor)
+                else:
+                    prox_term = prox_term + torch.sum(diff_sq)
             loss = loss + (mu / 2.0) * prox_term
 
         loss.backward()
@@ -227,17 +333,21 @@ def server_aggregate(
     global_model: nn.Module,
     client_models: list[nn.Module],
     client_sample_counts: list[int],
+    client_class_counts: np.ndarray | None = None,
+    class_agg_gamma: float = 0.0,
+    num_classes: int = 8,
 ) -> nn.Module:
     """
-    클라이언트들의 샘플 수에 비례한 가중 평균으로 글로벌 모델 파라미터를 집계(Aggregation)합니다.
+    클라이언트 모델 파라미터를 집계(Aggregation)하여 글로벌 모델을 업데이트합니다.
 
-    Args:
-        global_model: 업데이트할 글로벌 모델
-        client_models: 학습 완료된 로컬 모델 리스트
-        client_sample_counts: 각 클라이언트의 데이터 샘플 수 리스트
-
-    Returns:
-        nn.Module: 파라미터가 업데이트된 글로벌 모델
+    - 기본 동작 (FedAvg / FedProx, client_class_counts=None 또는 class_agg_gamma=0.0):
+      전체 샘플 수 비율(w_k = n_k / N)에 따른 가중 평균으로 모든 레이어를 집계합니다.
+    - CA-FedProx 동작 (client_class_counts 제공 및 class_agg_gamma > 0.0):
+      백본(특징 추출기)은 전체 샘플 수 비율(n_k / N)로 집계하여 다기관 시각 특징 표현력을 공유하고,
+      마지막 분류기 헤드(Classifier Linear Layer)의 각 클래스 c(0..7) 행은 실제 해당 클래스 보유 비중(n_{k,c} / N_c)과
+      전체 샘플 비중(n_k / N)을 결합해 집계합니다:
+          alpha_{k,c} = gamma * (n_{k,c} / N_c) + (1 - gamma) * (n_k / N)
+      이를 통해 특정 질환(예: 7: SCC, 3: AK) 샘플이 0장인 병원들이 해당 질환 분류기 가중치를 희석(Dilution)시키는 현상을 방지합니다.
     """
     if len(client_models) == 0:
         raise ValueError("client_models 리스트가 비어 있습니다.")
@@ -250,11 +360,48 @@ def server_aggregate(
     global_state = copy.deepcopy(global_model.state_dict())
     client_states = [m.state_dict() for m in client_models]
 
+    use_class_aware = (
+        client_class_counts is not None and float(class_agg_gamma) > 0.0
+    )
+    cls_weight_name, cls_bias_name = _get_classifier_param_names(
+        global_model, num_classes=num_classes
+    )
+
+    if use_class_aware:
+        counts_mat = np.asarray(client_class_counts, dtype=np.float64)
+        class_totals = np.maximum(counts_mat.sum(axis=0), 1.0)  # shape (num_classes,)
+        gamma = float(np.clip(class_agg_gamma, 0.0, 1.0))
+        # class_weights[k, c] = alpha_{k, c}, 각 클래스 c에 대해 sum_k alpha_{k, c} == 1.0
+        base_w = np.asarray(weights, dtype=np.float64)[:, None]
+        cls_w = counts_mat / class_totals[None, :]
+        alpha_kc = gamma * cls_w + (1.0 - gamma) * base_w
+        alpha_kc = alpha_kc / np.maximum(alpha_kc.sum(axis=0, keepdims=True), 1e-12)
+    else:
+        alpha_kc = None
+
     with torch.no_grad():
         for key in global_state.keys():
             target_tensor = global_state[key]
-            # 실수형(float) 파라미터/버퍼는 가중 평균, 정수형 버퍼(num_batches_tracked 등)는 가중 평균 후 반올림
-            if torch.is_floating_point(target_tensor):
+            if (
+                use_class_aware
+                and alpha_kc is not None
+                and key in (cls_weight_name, cls_bias_name)
+                and torch.is_floating_point(target_tensor)
+                and target_tensor.shape[0] == num_classes
+            ):
+                accum = torch.zeros_like(target_tensor, dtype=torch.float32)
+                for k, c_state in enumerate(client_states):
+                    w_c = torch.as_tensor(
+                        alpha_kc[k], dtype=torch.float32, device=accum.device
+                    )
+                    if accum.ndim == 2:
+                        accum += w_c.unsqueeze(1) * c_state[key].to(
+                            accum.device, dtype=torch.float32
+                        )
+                    else:
+                        accum += w_c * c_state[key].to(accum.device, dtype=torch.float32)
+                global_state[key] = accum.to(dtype=target_tensor.dtype)
+            elif torch.is_floating_point(target_tensor):
                 accum = torch.zeros_like(target_tensor, dtype=torch.float32)
                 for w, c_state in zip(weights, client_states):
                     accum += w * c_state[key].to(accum.device, dtype=torch.float32)
