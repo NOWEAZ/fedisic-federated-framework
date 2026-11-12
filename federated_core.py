@@ -6,7 +6,23 @@ import torch.nn.functional as F
 from torchvision import models
 from sklearn.metrics import balanced_accuracy_score, f1_score
 from tqdm import tqdm
-from flamby.datasets.fed_isic2019 import Baseline, BaselineLoss, Optimizer
+try:
+    from flamby.datasets.fed_isic2019 import Baseline, BaselineLoss, Optimizer
+except Exception:
+    Baseline = None
+    BaselineLoss = None
+    Optimizer = torch.optim.Adam
+
+
+class _EfficientNetPyTorchWrapper(nn.Module):
+    """FLamby Baseline과 동일한 state_dict 키 구조(base_model.*)를 유지하는 래퍼입니다."""
+
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base_model = base_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base_model(x)
 
 
 class ClientStepIterator:
@@ -37,14 +53,30 @@ class ClientStepIterator:
 def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.Module:
     """
     FLamby Fed-ISIC2019 공식 Baseline 모델(ImageNet 사전학습 EfficientNet-B0, 8클래스 분류기)을 생성합니다.
-    - pretrained=True이고 num_classes=8(기본값)일 때 FLamby 공식 `Baseline()`을 우선 반환합니다.
-    - 커스텀 클래스 수이거나 Baseline 초기화가 불가능한 환경에서는 torchvision의 EfficientNet-B0로 대체합니다.
+    - FLamby 공식 `Baseline` 또는 `efficientnet_pytorch`가 설치된 경우 동일한 키 구조(`base_model.*`)를 반환합니다.
+    - 두 패키지가 없는 경량 환경에서는 torchvision의 EfficientNet-B0로 대체합니다.
     """
-    if pretrained and num_classes == 8:
+    if Baseline is not None and num_classes == 8:
         try:
-            return Baseline()
+            return Baseline(pretrained=pretrained)
+        except TypeError:
+            if pretrained:
+                return Baseline()
         except Exception:
             pass
+
+    try:
+        from efficientnet_pytorch import EfficientNet
+        base = (
+            EfficientNet.from_pretrained("efficientnet-b0")
+            if pretrained
+            else EfficientNet.from_name("efficientnet-b0")
+        )
+        in_features = base._fc.in_features
+        base._fc = nn.Linear(in_features, num_classes)
+        return _EfficientNetPyTorchWrapper(base)
+    except Exception:
+        pass
 
     try:
         weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
@@ -56,6 +88,90 @@ def build_efficientnet_b0(num_classes: int = 8, pretrained: bool = True) -> nn.M
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, num_classes)
     return model
+
+
+def load_compatible_state_dict(model: nn.Module, state_dict: dict) -> int:
+    """
+    FLamby/efficientnet_pytorch(`base_model.*`)와 torchvision(`features.*`, `classifier.1.*`) 간
+    state_dict 키 구조를 자동 호환하여 가중치를 100% 로드하고, 매칭된 텐서 수를 반환합니다.
+    """
+    model_keys = set(model.state_dict().keys())
+    direct_matches = len(model_keys & set(state_dict.keys()))
+    if direct_matches == len(model_keys):
+        model.load_state_dict(state_dict, strict=True)
+        return direct_matches
+
+    # base_model.* (efficientnet_pytorch) -> features.* / classifier.1.* (torchvision) 1:1 변환
+    block_to_stage_sub = [
+        (1, 0),
+        (2, 0), (2, 1),
+        (3, 0), (3, 1),
+        (4, 0), (4, 1), (4, 2),
+        (5, 0), (5, 1), (5, 2),
+        (6, 0), (6, 1), (6, 2), (6, 3),
+        (7, 0),
+    ]
+    converted = {}
+    for k, v in state_dict.items():
+        clean_k = k[len("base_model."):] if k.startswith("base_model.") else k
+        new_k = None
+        if clean_k == "_conv_stem.weight":
+            new_k = "features.0.0.weight"
+        elif clean_k.startswith("_bn0."):
+            new_k = "features.0.1." + clean_k[len("_bn0."):]
+        elif clean_k == "_conv_head.weight":
+            new_k = "features.8.0.weight"
+        elif clean_k.startswith("_bn1."):
+            new_k = "features.8.1." + clean_k[len("_bn1."):]
+        elif clean_k.startswith("_fc."):
+            new_k = "classifier.1." + clean_k[len("_fc."):]
+        elif clean_k.startswith("_blocks."):
+            parts = clean_k.split(".")
+            blk_idx = int(parts[1])
+            layer_name = parts[2]
+            suffix = ".".join(parts[3:])
+            stage, sub = block_to_stage_sub[blk_idx]
+            prefix = f"features.{stage}.{sub}.block"
+            if blk_idx == 0:
+                if layer_name == "_depthwise_conv":
+                    new_k = f"{prefix}.0.0.{suffix}"
+                elif layer_name == "_bn1":
+                    new_k = f"{prefix}.0.1.{suffix}"
+                elif layer_name == "_se_reduce":
+                    new_k = f"{prefix}.1.fc1.{suffix}"
+                elif layer_name == "_se_expand":
+                    new_k = f"{prefix}.1.fc2.{suffix}"
+                elif layer_name == "_project_conv":
+                    new_k = f"{prefix}.2.0.{suffix}"
+                elif layer_name == "_bn2":
+                    new_k = f"{prefix}.2.1.{suffix}"
+            else:
+                if layer_name == "_expand_conv":
+                    new_k = f"{prefix}.0.0.{suffix}"
+                elif layer_name == "_bn0":
+                    new_k = f"{prefix}.0.1.{suffix}"
+                elif layer_name == "_depthwise_conv":
+                    new_k = f"{prefix}.1.0.{suffix}"
+                elif layer_name == "_bn1":
+                    new_k = f"{prefix}.1.1.{suffix}"
+                elif layer_name == "_se_reduce":
+                    new_k = f"{prefix}.2.fc1.{suffix}"
+                elif layer_name == "_se_expand":
+                    new_k = f"{prefix}.2.fc2.{suffix}"
+                elif layer_name == "_project_conv":
+                    new_k = f"{prefix}.3.0.{suffix}"
+                elif layer_name == "_bn2":
+                    new_k = f"{prefix}.3.1.{suffix}"
+        if new_k is not None:
+            converted[new_k] = v
+
+    converted_matches = len(model_keys & set(converted.keys()))
+    if converted_matches > direct_matches:
+        model.load_state_dict(converted, strict=False)
+        return converted_matches
+
+    model.load_state_dict(state_dict, strict=False)
+    return direct_matches
 
 
 def _sync_criterion_device(criterion: nn.Module, device: torch.device | str) -> nn.Module:

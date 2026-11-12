@@ -1,8 +1,10 @@
 torch
 torchvision
+efficientnet-pytorch>=0.7.1
 scikit-learn
 pandas
 matplotlib
 tqdm
-
+Pillow
+streamlit
 albumentations==1.3.1
